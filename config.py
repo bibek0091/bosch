@@ -107,7 +107,7 @@ GUARD_EMA: float       = 0.55   # EMA weight for divider-guard correction
 STEER_DEADBAND: float  = 0.5    # degrees — suppress tiny changes to servo
 
 # Hard limits
-MAX_STEER: float      = 30.0   # degrees (serial_handler clamps ±25, keep ≤25 on hardware)
+MAX_STEER: float      = 25.0   # degrees — matches STM32 serial_handler hardware clamp (±25)
 MAX_STEER_RATE: float = 5.0    # degrees per frame — rate limiter
 
 # DividerGuard
@@ -196,7 +196,7 @@ AI_FPS: int = 8   # detector thread run rate (Hz)
 WATCHDOG_TIMEOUT_S: float = 2.0
 
 # Confidence thresholds (0–1)
-CONF_TRAFFIC_LIGHT: float = 0.20   # catch miniature lights at distance
+CONF_TRAFFIC_LIGHT: float = 0.30   # raised from 0.20 — reduces false RED stops (BFMC Competition Fix)
 CONF_ROAD_SIGN: float     = 0.25   # catch small sign models
 CONF_LANE_DIVIDER: float  = 0.40
 CONF_OBSTACLE: float      = 0.40
@@ -229,14 +229,21 @@ DETOUR_RAMP_SECONDS: float = 0.67  # ~20 frames
 
 # Highway mode
 HIGHWAY_SPEED_FACTOR: float = 1.40
-HIGHWAY_HOLD_SECONDS: float = 5.0
+HIGHWAY_HOLD_SECONDS: float = 8.0    # Increased from 5.0s — longer tracks need more time
 
 # Stop sign
-STOP_SIGN_HOLD_SECONDS: float = 3.0
+STOP_SIGN_HOLD_SECONDS: float    = 3.0
+STOP_SIGN_DEBOUNCE_SECONDS: float = 0.17  # Same pattern as TL debounce — prevents 1-frame false stops
+
+# Lane divider advisory (AI supplemental — CV is primary)
+DIVIDER_ADVISORY_OFFSET_PX: int = 20  # small lateral nudge when divider detected near centre
 
 # ===========================================================================
 # SECTION 12 — DASHBOARD
 # ===========================================================================
+# BEV car-centre x — single source of truth for DividerGuard, LookAhead, etc.
+CAR_X_BEV: int = BEV_W // 2
+
 DASH_W: int   = 1280   # total dashboard window width
 DASH_H: int   = 720    # total dashboard window height
 
@@ -274,6 +281,10 @@ ANCHOR_COLORS: dict[str, tuple[int, int, int]] = {
 
 # Sign display duration (seconds)
 DASH_SIGN_DISPLAY_SEC: float = 3.0
+
+# Speed gauge display (dashboard uses these via getattr)
+DASH_MAX_SPEED: int       = 200       # throttle units (0-200)
+DASH_SPEED_LABEL: str     = "thr"     # label shown under the speed number
 
 # ===========================================================================
 # SECTION 13 — HONK / HORN

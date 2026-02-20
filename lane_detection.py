@@ -13,6 +13,7 @@ Classes exported:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 import cv2
@@ -186,7 +187,9 @@ class HybridLaneTracker:
 
     def get_curvature(self, y_eval: int) -> float:
         """
-        vature = |2a| / (1 + (2ay+b)^2)^1.5
+        Standard road curvature from 2nd-degree polynomial ax^2 + bx + c:
+          curvature = |2a| / (1 + (2ay + b)^2)^1.5
+        Returns curvature in pixel-space (1/px). Zero when no fit available.
         """
         fit = self.sr if self.sr is not None else self.sl
         if fit is None:
@@ -373,8 +376,7 @@ class JunctionDetector:
 
         now = time.monotonic()
         self.heartbeat = now
-
-        evidence = both_lost or cross_energy or wide_lane
+        # (evidence already computed above — no duplicate)
 
         if self.state == "NORMAL":
             if evidence:

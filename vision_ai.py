@@ -406,6 +406,13 @@ class VisionAI:
         self._last_tl: tuple[TrafficLightState, Optional[tuple]] = \
             (TrafficLightState.NONE, None)
 
+        # Competition: log if obstacle model is disabled
+        if not config.MODEL_OBSTACLE:
+            log.warning(
+                "VisionAI: MODEL_OBSTACLE is empty — obstacle avoidance DISABLED. "
+                "Set config.MODEL_OBSTACLE to a YOLOv8 .pt path to enable."
+            )
+
     def start(self, shared_state: VisionState) -> None:
         self._shared  = shared_state
         self._running = True
@@ -467,24 +474,34 @@ class VisionAI:
 
     def _rebuild_overlays(self, tl_state: TrafficLightState,
                            tl_bbox: Optional[tuple]) -> None:
-        """Rebuild the unified overlay list. Fix 8: added obstacles."""
+        """Rebuild the unified overlay list for the raw-camera window."""
         items: list = []
         if tl_bbox and tl_state != TrafficLightState.NONE:
             items.append((f"TL:{tl_state.name}", 1.0, tl_bbox))
-        
+
         if self._shared is not None:
             with self._shared.lock:
-                sign = self._shared.sign
-                obs  = self._shared.obstacle
-            
+                sign    = self._shared.sign
+                obs     = self._shared.obstacle
+                divider = self._shared.lane_divider
+
             if sign is not None and sign.bbox is not None:
                 items.append((sign.sign_type, sign.confidence, sign.bbox))
-            
-            # Fix 8: Draw obstacle if present
+
+            # Draw obstacle if present
             if obs is not None and obs.present and obs.bbox is not None:
                 label = f"OBSTACLE:{obs.estimated_side.name}"
                 items.append((label, 1.0, obs.bbox))
-                
+
+            # Competition Fix: include lane divider position as a visual marker
+            # Represent the divider as a thin vertical bbox at its estimated x position
+            if divider is not None and divider.confidence >= config.CONF_LANE_DIVIDER:
+                # Create a narrow synthetic bbox spanning the full height at divider x
+                dx = int(divider.x_position)
+                div_bbox = (max(0, dx - 4), 0, min(config.CAM_W, dx + 4), config.CAM_H)
+                items.append((f"DIVIDER:{divider.divider_type}",
+                              divider.confidence, div_bbox))
+
         self._overlay.set(items)
 
     def _tl_loop(self) -> None:

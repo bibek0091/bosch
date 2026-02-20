@@ -116,6 +116,7 @@ class BFMCPilot:
 
         # EMA FPS tracker
         self._fps: float = 0.0
+        self._start_time: float = time.monotonic()  # for uptime logging
 
     # -----------------------------------------------------------------------
     def start(self) -> None:
@@ -168,7 +169,8 @@ class BFMCPilot:
 
     def stop(self) -> None:
         """Clean shutdown — zero actuators, stop all threads."""
-        log.info("BFMCPilot: stopping …")
+        uptime = time.monotonic() - self._start_time
+        log.info("BFMCPilot: stopping … (uptime %.1fs)", uptime)
 
         # Zero actuators
         if self.connected:
@@ -186,7 +188,7 @@ class BFMCPilot:
             self.dash.stop()
 
         cv2.destroyAllWindows()
-        log.info("BFMCPilot: stopped.")
+        log.info("BFMCPilot: stopped. Total uptime: %.1fs", uptime)
 
     # -----------------------------------------------------------------------
     def run(self) -> None:
@@ -345,7 +347,7 @@ class BFMCPilot:
     # -----------------------------------------------------------------------
 
     def _check_watchdog(self) -> None:
-        """Fix 40: Check component heartbeats and log warnings if stalled."""
+        """Check all component heartbeats and log warnings if stalled."""
         now     = time.monotonic()
         timeout = getattr(config, "WATCHDOG_TIMEOUT_S", 2.0)
 
@@ -361,8 +363,16 @@ class BFMCPilot:
             if v_dt > timeout:
                 log.warning("WATCHDOG: VisionAI [%s] stalled (%.1fs pulse)", name, v_dt)
 
+        # 3. ObstacleHandler (Competition Fix: added to watchdog)
+        obs_dt = now - self.obs_hdlr.heartbeat
+        if obs_dt > timeout * 2:   # more lenient — only runs when obstacle present
+            log.debug("WATCHDOG: ObstacleHandler heartbeat age=%.1fs", obs_dt)
+
     def _actuate(self, speed: float, steer: float) -> None:
         s_clamped = float(max(-config.MAX_STEER, min(config.MAX_STEER, steer)))
+        if abs(s_clamped - steer) > 0.05:
+            log.debug("_actuate: steer clamped %.1f° → %.1f° (MAX_STEER=%.1f)",
+                      steer, s_clamped, config.MAX_STEER)
         if self._sim_mode:
             log.debug("SIM actuation: speed=%.1f  steer=%.2f°", speed, s_clamped)
             return

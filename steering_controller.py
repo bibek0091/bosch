@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import logging
+import time
 from typing import Optional
 
 import numpy as np
@@ -53,7 +54,7 @@ class DividerGuard:
         left_fit:  Optional[np.ndarray],
         right_fit: Optional[np.ndarray],
         y_eval: int = 440,
-        car_x:  int = 320,
+        car_x:  int = config.CAR_X_BEV,   # BEV image centre — use config, not magic number
     ) -> tuple[float, float, bool]:
         """
         Parameters
@@ -216,11 +217,7 @@ class SpeedPolicy:
         
         # 1. Behavior override (Priority) - behavior_cmd is already scaled in BehaviorEngine
         if behavior_cmd.mode == BehaviorMode.FULL_STOP:
-            # Fix 32: Reset on stop
-            # SpeedPolicy does not have a reset method, this might be a placeholder or intended for a different class.
-            # For now, we'll just return 0.0 as per the original logic.
-            # self.reset() 
-            return 0.0
+            return 0.0  # SteeringController.reset() is called by main.py on speed==0
         
         effective_base = base_speed * behavior_cmd.speed_multiplier
         
@@ -250,6 +247,8 @@ class SpeedPolicy:
         # --- Base = 0 or Below Stall Threshold (Fix 15) ---
         stall_limit = getattr(config, "MOTOR_STALL_THRESHOLD", 30.0)
         if effective_base < stall_limit:
+            log.debug("SpeedPolicy: effective_base=%.1f below stall_limit=%.1f → 0",
+                      effective_base, stall_limit)
             return 0.0
 
         # --- Nav state ---
@@ -337,7 +336,8 @@ class SteeringController:
         Returns (guarded_steer, guard_speed_scale, guard_triggered).
         """
         raw_guarded, guard_spd, guard_on = self._guard.apply(
-            steer_angle, left_fit, right_fit, y_eval=y_eval
+            steer_angle, left_fit, right_fit,
+            y_eval=y_eval, car_x=config.CAR_X_BEV  # FIX: use config centre not magic 320
         )
 
         if lost:

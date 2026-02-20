@@ -58,6 +58,8 @@ class DashboardState:
     sign_conf:      Optional[float]  = None
     obstacle_state: str              = "CLEAR"
     behavior_mode:  str              = "NORMAL"
+    divider_x:      Optional[float]  = None  # Competition Fix: lane divider position
+    divider_type:   Optional[str]    = None  # "solid"|"dashed"|"unknown"
 
     main_fps:         float = 0.0
     vision_fps:       float = 0.0
@@ -197,6 +199,8 @@ class Dashboard:
             sign_conf      = s.sign_conf,
             obstacle_state = s.obstacle_state,
             behavior_mode  = s.behavior_mode,
+            divider_x      = s.divider_x,        # Competition Fix
+            divider_type   = s.divider_type,     # Competition Fix
             main_fps       = s.main_fps,
             vision_fps     = s.vision_fps,
             serial         = s.serial_connected,
@@ -395,15 +399,35 @@ class Dashboard:
             _rr(c, x0, y0, x0 + pw, y0 + bev_h, C_GREY, 6)
 
         cy = y0 + bev_h + 12
+        # Curvature quality: straight / gentle / curve
+        curv = abs(s['curvature'])
+        curv_str = ("STRAIGHT" if curv < 0.0008
+                    else "GENTLE" if curv < 0.0020
+                    else "CURVE" if curv < 0.0040
+                    else "SHARP")
+        curv_col = (C_GREEN if curv < 0.0008
+                    else C_BLUE if curv < 0.0020
+                    else C_YELLOW if curv < 0.0040
+                    else C_RED)
+
+        # Divider indicator string
+        if s.get("divider_x") is not None:
+            div_str = f"{s['divider_type'] or 'unknown'} @ {int(s['divider_x'])}px"
+            div_col = C_CYAN
+        else:
+            div_str = "N/A"
+            div_col = C_GREY
+
         cards = [
             ("LOST FRAMES", str(s["lost_frames"]),
              C_RED if s["lost_frames"] > 3 else C_GREEN),
             ("DETECT MODE", s["detect_mode"],   C_CYAN),
-            ("CURVATURE",  f"{s['curvature']:.4f}", C_BLUE),
+            ("CURVATURE",  f"{s['curvature']:.4f}  {curv_str}", curv_col),
             ("ANCHOR",      s["anchor"],
              config.ANCHOR_COLORS.get(s["anchor"], C_DIMWHITE)),
             ("OBSTACLE",    s["obstacle_state"],
              C_RED if s["obstacle_state"] != "CLEAR" else C_GREEN),
+            ("LANE DIV",   div_str, div_col),  # Competition Fix: lane divider card
         ]
         for label, val, col in cards:
             _card(c, x0, cy, pw, 40, label, val, col)
@@ -580,11 +604,22 @@ def _metric(img, x, y, label, value, color):
 
 
 def _nav_col(state):
-    return {"ROUNDABOUT": C_ORANGE, "JUNCTION": C_YELLOW, "NORMAL": C_GREEN}.get(state, C_DIMWHITE)
+    return {
+        "ROUNDABOUT": C_ORANGE,
+        "JUNCTION":   C_YELLOW,
+        "NORMAL":     C_GREEN,
+    }.get(state, C_DIMWHITE)
 
 def _behav_col(mode):
-    return {"FULL_STOP": C_RED, "SLOW": C_YELLOW, "HIGHWAY": C_BLUE,
-            "DETOUR": C_CYAN, "NORMAL": C_GREEN}.get(mode, C_DIMWHITE)
+    return {
+        "FULL_STOP": C_RED,
+        "SLOW":      C_YELLOW,
+        "HIGHWAY":   C_BLUE,
+        "DETOUR":    C_CYAN,
+        "HONK":      C_ORANGE,   # Competition Fix: HONK mode colour added
+        "STOP_SIGN": C_RED,      # Competition Fix: explicit STOP_SIGN badge colour
+        "NORMAL":    C_GREEN,
+    }.get(mode, C_DIMWHITE)
 
 
 # ---------------------------------------------------------------------------
