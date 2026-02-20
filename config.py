@@ -238,6 +238,9 @@ STOP_SIGN_DEBOUNCE_SECONDS: float = 0.17  # Same pattern as TL debounce — prev
 # Lane divider advisory (AI supplemental — CV is primary)
 DIVIDER_ADVISORY_OFFSET_PX: int = 20  # small lateral nudge when divider detected near centre
 
+# Robustness: grace period for dropped detection frames
+DETECTION_GRACE_SECONDS: float = 0.10  # allow ~3 missed frames before resetting stop timers
+
 # ===========================================================================
 # SECTION 12 — DASHBOARD
 # ===========================================================================

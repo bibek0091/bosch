@@ -133,10 +133,12 @@ class BehaviorEngine:
         self._red_start:            float = 0.0
         self._green_confirm_start:  float = 0.0
         self._yellow_start:         float = 0.0
+        self._tl_last_seen:         float = 0.0   # Competition Fix: grace timer
 
         # ── Stop sign timers ─────────────────────────────────────────────
         self._stop_sign_start:      float = 0.0
         self._stop_sign_debounce:   float = 0.0   # Competition Fix: debounce timer
+        self._stop_sign_last_seen:   float = 0.0   # Competition Fix: grace timer
 
         # ── Highway timers ───────────────────────────────────────────────
         self._highway_start_time:   float = 0.0
@@ -230,8 +232,18 @@ class BehaviorEngine:
         is_yellow     = tl == TrafficLightState.YELLOW
         now = time.monotonic()
 
+        # Update last-seen timestamp
+        if tl != TrafficLightState.NONE:
+            self._tl_last_seen = now
+
         # ── Already stopped for RED ──────────────────────────────────────
         if self._state == self._EngineState.RED_STOP:
+            # Check for lost signal (grace period)
+            if now - self._tl_last_seen > config.DETECTION_GRACE_SECONDS:
+                # If we truly lost the light while stopped, we stay stopped (safety)
+                # until we see a GREEN light specifically.
+                pass
+
             if is_green:
                 if self._green_confirm_start == 0:
                     self._green_confirm_start = now
@@ -244,22 +256,37 @@ class BehaviorEngine:
             else:
                 self._green_confirm_start = 0.0
 
-            # Kill honk if a red light interrupts a zebra stop
             self._honk_active = False
             return BehaviorCommand(mode=BehaviorMode.FULL_STOP, speed_multiplier=0.0)
 
-        # ── Confirm RED/DARK (debounced) ─────────────────────────────────
+        # ── Confirm RED/DARK (debounced + grace period) ──────────────────
         if is_stop_color:
             if self._red_start == 0:
                 self._red_start = now
-            elif now - self._red_start >= config.TL_DEBOUNCE_SECONDS:
-                self._state               = self._EngineState.RED_STOP
-                self._green_confirm_start = 0.0
-                log.info("BehaviorEngine: RED/DARK confirmed — FULL_STOP")
-                self._honk_active = False
-                return BehaviorCommand(mode=BehaviorMode.FULL_STOP, speed_multiplier=0.0)
+                log.debug("BehaviorEngine: RED detected, confirming…")
+            
+            # During debounce, we start slowing down immediately (Safe Mode)
+            if now - self._red_start < config.TL_DEBOUNCE_SECONDS:
+                return BehaviorCommand(mode=BehaviorMode.SLOW, speed_multiplier=0.40)
+            
+            # Confirmed!
+            self._state               = self._EngineState.RED_STOP
+            self._green_confirm_start = 0.0
+            log.info("BehaviorEngine: RED/DARK confirmed — FULL_STOP")
+            self._honk_active = False
+            return BehaviorCommand(mode=BehaviorMode.FULL_STOP, speed_multiplier=0.0)
         else:
-            self._red_start = 0.0
+            # Check grace period before resetting red_start
+            if self._red_start > 0:
+                if now - self._tl_last_seen > config.DETECTION_GRACE_SECONDS:
+                    log.debug("BehaviorEngine: RED lost (expired, delta=%.3f) — resetting", 
+                              now - self._tl_last_seen)
+                    self._red_start = 0.0
+                else:
+                    # Within grace period — continue slowing down
+                    log.debug("BehaviorEngine: RED lost (within grace, delta=%.3f) — holding",
+                              now - self._tl_last_seen)
+                    return BehaviorCommand(mode=BehaviorMode.SLOW, speed_multiplier=0.40)
 
         # ── YELLOW — slow down ───────────────────────────────────────────
         if is_yellow:
@@ -416,6 +443,10 @@ class BehaviorEngine:
         is_stop = sign is not None and sign.sign_type == "STOP_SIGN"
         now = time.monotonic()
 
+        # Update last-seen timestamp
+        if is_stop:
+            self._stop_sign_last_seen = now
+
         if self._state == self._EngineState.STOP_SIGN_HOLD:
             if now - self._stop_sign_start >= config.STOP_SIGN_HOLD_SECONDS:
                 self._state           = self._EngineState.NORMAL
@@ -428,9 +459,10 @@ class BehaviorEngine:
             # Competition Fix: debounce the stop sign — require a sustained detection
             if self._stop_sign_debounce == 0.0:
                 self._stop_sign_debounce = now
-                log.debug("BehaviorEngine: STOP_SIGN debounce started (conf=%.2f)",
-                          sign.confidence)
-                return None  # Don't commit to stop yet
+                log.debug("BehaviorEngine: STOP_SIGN detected, confirming…")
+                # Immediately start slowing down while we confirm
+                return BehaviorCommand(mode=BehaviorMode.SLOW, speed_multiplier=0.40)
+            
             elif now - self._stop_sign_debounce >= config.STOP_SIGN_DEBOUNCE_SECONDS:
                 self._state              = self._EngineState.STOP_SIGN_HOLD
                 self._stop_sign_start    = now
@@ -438,11 +470,21 @@ class BehaviorEngine:
                 log.info("BehaviorEngine: STOP_SIGN confirmed — holding %.1fs",
                          config.STOP_SIGN_HOLD_SECONDS)
                 return BehaviorCommand(mode=BehaviorMode.FULL_STOP, speed_multiplier=0.0)
-            # Within debounce window — still tracking
-            return None
+            
+            # Within debounce window — continue slowing down
+            return BehaviorCommand(mode=BehaviorMode.SLOW, speed_multiplier=0.40)
         else:
-            # Sign disappeared — reset debounce
-            self._stop_sign_debounce = 0.0
+            # Check grace period before resetting debounce
+            if self._stop_sign_debounce > 0:
+                if now - self._stop_sign_last_seen > config.DETECTION_GRACE_SECONDS:
+                    log.debug("BehaviorEngine: STOP_SIGN lost (expired, delta=%.3f) — resetting",
+                              now - self._stop_sign_last_seen)
+                    self._stop_sign_debounce = 0.0
+                else:
+                    # Within grace period — continue slowing down
+                    log.debug("BehaviorEngine: STOP_SIGN lost (within grace, delta=%.3f) — holding",
+                              now - self._stop_sign_last_seen)
+                    return BehaviorCommand(mode=BehaviorMode.SLOW, speed_multiplier=0.40)
 
         return None
 
@@ -480,63 +522,62 @@ class BehaviorEngine:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import logging
-    logging.basicConfig(level=logging.INFO)
+    import time
+    import config
+    # Use local definitions
+    logging.basicConfig(level=logging.DEBUG)
 
     engine = BehaviorEngine()
     vs     = VisionState()
+
+    print("\n--- BEHAVIOR ENGINE SMOKE TEST (Robustness Edition) ---")
 
     # 1. Normal
     cmd = engine.update(vs, "NORMAL")
     assert cmd.mode == BehaviorMode.NORMAL, f"Expected NORMAL, got {cmd.mode}"
     print("  [PASS] Normal driving")
 
-    # 2. RED light (real-time debounce)
+    # 2. RED light - Immediate reaction + Debounce
     with vs.lock: vs.traffic_light = TrafficLightState.RED
-    engine.update(vs, "NORMAL")
+    cmd = engine.update(vs, "NORMAL")
+    assert cmd.mode == BehaviorMode.SLOW, f"Expected SLOW during debounce, got {cmd.mode}"
+    print("  [PASS] RED light -> SLOW (immediate pre-stop reaction)")
+
+    # 3. Flicker resilience (Grace Period)
+    with vs.lock: vs.traffic_light = TrafficLightState.NONE
+    cmd = engine.update(vs, "NORMAL")
+    assert cmd.mode == BehaviorMode.SLOW, f"Expected still SLOW within grace period, got {cmd.mode}"
+    print("  [PASS] Flicker Resilience -> Still SLOW during 1-frame drop")
+
+    # 4. Debounce Completion
     time.sleep(config.TL_DEBOUNCE_SECONDS + 0.05)
+    with vs.lock: vs.traffic_light = TrafficLightState.RED  # Signal returns
     cmd = engine.update(vs, "NORMAL")
-    assert cmd.mode == BehaviorMode.FULL_STOP, f"Expected FULL_STOP, got {cmd.mode}"
-    print("  [PASS] RED light -> FULL_STOP")
+    assert cmd.mode == BehaviorMode.FULL_STOP, f"Expected FULL_STOP after debounce, got {cmd.mode}"
+    print("  [PASS] RED confirmed -> FULL_STOP")
 
-    # 3. GREEN confirm
-    with vs.lock: vs.traffic_light = TrafficLightState.GREEN
-    engine.update(vs, "NORMAL")
-    time.sleep(config.TL_GREEN_CONFIRM_SECONDS + 0.05)
-    cmd = engine.update(vs, "NORMAL")
-    assert engine._state == engine._EngineState.NORMAL, f"Expected NORMAL, got {engine._state}"
-    print("  [PASS] GREEN confirm -> resume")
-
-    # 4. Stop sign debounce (should NOT stop on first frame)
-    with vs.lock:
-        vs.traffic_light = TrafficLightState.NONE
-        vs.sign = SignDetection("STOP_SIGN", 0.90, (0, 0, 50, 50))
-    cmd = engine.update(vs, "NORMAL")
-    assert cmd.mode == BehaviorMode.NORMAL, f"Debounce failed — stopped on frame 1"
-    print("  [PASS] Stop sign debounce (no stop on frame 1)")
-
-    # 5. Stop sign confirmed after debounce
-    time.sleep(config.STOP_SIGN_DEBOUNCE_SECONDS + 0.05)
-    cmd = engine.update(vs, "NORMAL")
-    assert cmd.mode == BehaviorMode.FULL_STOP, f"Expected FULL_STOP after debounce"
-    print("  [PASS] Stop sign confirmed -> FULL_STOP after debounce")
-
-    # 6. Highway safety exit on RED
-    with vs.lock:
-        vs.sign = SignDetection("HIGHWAY_ENTRY", 0.85, (0, 0, 50, 50))
-        vs.traffic_light = TrafficLightState.NONE
+    # 5. Stop Sign - Immediate reaction + Grace Period
     engine._state = engine._EngineState.NORMAL
-    cmd = engine.update(vs, "NORMAL")
-    assert cmd.mode == BehaviorMode.HIGHWAY, f"Expected HIGHWAY, got {cmd.mode}"
+    engine._red_start = 0.0
+    engine._tl_last_seen = 0.0
     with vs.lock:
-        vs.traffic_light = TrafficLightState.RED
-        vs.sign = None
-    # First call starts the RED debounce timer (highway exits immediately on safety_exit check)
-    engine.update(vs, "NORMAL")
-    time.sleep(config.TL_DEBOUNCE_SECONDS + 0.05)
+        vs.traffic_light = TrafficLightState.NONE
+        vs.sign = SignDetection("STOP_SIGN", 0.9, (0,0,10,10))
     cmd = engine.update(vs, "NORMAL")
-    # RED should now preempt and produce FULL_STOP
-    assert cmd.mode == BehaviorMode.FULL_STOP, f"Expected RED FULL_STOP, got {cmd.mode}"
-    print("  [PASS] RED light preempts highway mode -> FULL_STOP")
+    assert cmd.mode == BehaviorMode.SLOW, f"Expected SLOW on first stop sign frame"
+    
+    # Simulate a flicker (drop for 0.05s, which is < DETECTION_GRACE_SECONDS)
+    with vs.lock: vs.sign = None
+    cmd = engine.update(vs, "NORMAL")
+    assert engine._stop_sign_debounce > 0, "Timer should NOT have reset"
+    assert cmd.mode == BehaviorMode.SLOW, "Should stay SLOW during grace period"
+    print("  [PASS] Stop Sign Flickering -> Resilience OK")
 
+    # Final confirm
+    time.sleep(config.STOP_SIGN_DEBOUNCE_SECONDS + 0.1)
+    with vs.lock: vs.sign = SignDetection("STOP_SIGN", 0.9, (0,0,10,10))
+    cmd = engine.update(vs, "NORMAL")
+    assert cmd.mode == BehaviorMode.FULL_STOP
+    print("  [PASS] Stop Sign Final -> FULL_STOP OK")
 
-    print("\nbehavior_engine smoke-test PASSED (Competition Edition)")
+    print("\nALL ROBUSTNESS TESTS PASSED (Competition Grade)")

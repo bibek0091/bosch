@@ -100,27 +100,43 @@ def _load_model(path: str, name: str) -> Optional["YOLO"]:
 def _norm_class_name(raw: str) -> str:
     """
     Normalise a raw class name from any model to one of the canonical tokens.
-    Fix 4: Priority check on 'red/yellow/green' before generic 'traffic light'.
-    Added 'dark', 'off', 'unlit' mappings.
+    Competition Fix: Extensive fuzzy matching for varied model naming conventions.
     """
-    s = raw.lower().strip()
-    
-    # Traffic light colours (Exact color detection takes priority over generic fixture)
-    if any(k in s for k in ("red", "stop_light")):
+    s = raw.lower().strip().replace("-", " ").replace("_", " ")
+
+    # 1. Traffic Light Colors (Highest Priority)
+    if any(k in s for k in ("red", "stop light")):
         return "red"
     if any(k in s for k in ("yellow", "amber")):
         return "yellow"
-    if any(k in s for k in ("green", "go_light")):
+    if any(k in s for k in ("green", "go light")):
         return "green"
-    
-    # Generic fixture or dark states
+
+    # 2. Stop Signs
+    if s == "stop" or "stop sign" in s:
+        return "STOP_SIGN"
+
+    # 3. Crossing / Zebra
+    if any(k in s for k in ("zebra", "crossing", "crosswalk")):
+        return "ZEBRA_CROSSING"
+
+    # 4. Highway Entry/Exit
+    if "highway" in s:
+        if any(k in s for k in ("entry", "on ramp", "ramp", "start", "begin")):
+            return "HIGHWAY_ENTRY"
+        if any(k in s for k in ("exit", "off ramp", "end", "stop")):
+            return "HIGHWAY_EXIT"
+        return "HIGHWAY_ENTRY"  # default to entry if highway seen
+
+    # 5. Parking / One Way
+    if "parking" in s: return "PARKING"
+    if "one way" in s: return "ONE_WAY"
+
+    # 6. Generic Traffic Light Fixture
     if any(k in s for k in ("traffic", "light", "signal", "tl", "fixture", "off", "dark", "unlit")):
-        # Guard: check if it's just 'light' which might be too generic
-        if s == "light" or s == "signal":
-            return "traffic_light"
         return "traffic_light"
 
-    # Sign / obstacle: return normalised upper_case
+    # Fallback: snake_case upper
     return raw.upper().replace(" ", "_").replace("-", "_")
 
 
