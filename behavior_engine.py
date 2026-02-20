@@ -288,9 +288,14 @@ class BehaviorEngine:
             has_obstacle = obstacle is not None and obstacle.present
 
             if not has_obstacle:
-                self._zebra_clear_frames += 1
+                # FIX: count frames where zebra sign is gone (car has passed)
+                # not just frames where there's no obstacle (wrong condition)
+                if not zebra_visible:
+                    self._zebra_clear_frames += 1
+                else:
+                    self._zebra_clear_frames = 0   # still approaching — reset
                 if self._zebra_clear_frames > config.ZEBRA_CLEAR_FRAMES:
-                    log.info("BehaviorEngine: zebra clear — resuming normal speed")
+                    log.info("BehaviorEngine: zebra cleared — resuming normal speed")
                     self._state = self._EngineState.NORMAL
                     return None
                 return BehaviorCommand(

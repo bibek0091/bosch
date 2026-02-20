@@ -159,6 +159,10 @@ class BFMCPilot:
             cv2.resizeWindow("BFMC Dashboard", config.DASH_W, config.DASH_H)
             cv2.moveWindow("BFMC Dashboard", 0, 0)   # force on-screen top-left
 
+        # Raw camera + AI detection window (separate from BEV debug)
+        cv2.namedWindow("Camera + AI", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Camera + AI", config.CAM_W, config.CAM_H)
+
         log.info("BFMCPilot: all sub-systems started (sim=%s)", self._sim_mode)
 
     def stop(self) -> None:
@@ -240,7 +244,7 @@ class BFMCPilot:
                 eff_la    = self._compute_lookahead(nav_state, curvature)
 
                 # ── 8. Target x ──────────────────────────────────────────
-                y_eval = self.tracker.h - 40
+                y_eval = max(0, self.tracker.h - eff_la)    # FIX: use eff_la not hardcoded 40
                 raw_target_x, anchor = self.tracker.get_target_x(
                     y_eval, self.lane_width_px, total_offset, nav_state
                 )
@@ -291,11 +295,14 @@ class BFMCPilot:
                 inst_fps   = 1.0 / max(elapsed, 1e-6)
                 self._fps  = 0.9 * self._fps + 0.1 * inst_fps
 
-                # ── 15. Debug window (minimal) ───────────────────────────
+                # ── 15. Raw camera window with AI detection overlays ──────
+                self._show_raw(frame)
+
+                # ── 16. BEV debug window ─────────────────────────────────
                 self._show_debug(dbg, steer_angle, speed, anchor, nav_state,
                                  detect_mode, guard_on, curvature)
 
-                # ── 16. Dashboard: imshow from MAIN THREAD ───────────────
+                # ── 17. Dashboard: imshow from MAIN THREAD ───────────────
                 self._update_dashboard(
                     frame, warped_colour, dbg, steer_angle, speed, anchor,
                     nav_state, curvature, guard_on, detect_mode,
@@ -342,6 +349,46 @@ class BFMCPilot:
         elif curvature > config.MED_CURV_THRESH:
             la = int(la * config.LA_MED_CURV_SCALE)
         return max(la, config.LA_MIN_PX)
+
+    def _show_raw(self, frame: np.ndarray) -> None:
+        """Show raw camera frame with AI bounding-box overlays."""
+        viz    = frame.copy()
+        overlays = self.vision.get_overlays()   # [(label, conf, bbox), ...]
+        for label, conf, bbox in overlays:
+            if bbox is None:
+                continue
+            x1, y1, x2, y2 = bbox
+            # Colour code by detection type
+            if label.startswith("TL:"):
+                tl_name = label.split(":")[-1]
+                col = (60, 220, 60) if "GREEN" in tl_name else \
+                      (0, 200, 220) if "YELLOW" in tl_name else \
+                      (50, 50, 220) if tl_name in ("RED", "DARK") else \
+                      (200, 200, 200)
+                cv2.rectangle(viz, (x1, y1), (x2, y2), col, 3)
+                cv2.putText(viz, label, (x1, max(y1 - 6, 14)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2, cv2.LINE_AA)
+                # Glow halo for traffic light
+                cv2.rectangle(viz, (x1-2, y1-2), (x2+2, y2+2), col, 1)
+            else:
+                col = (255, 160, 0)
+                cv2.rectangle(viz, (x1, y1), (x2, y2), col, 2)
+                cv2.putText(viz, f"{label} {conf:.0%}",
+                            (x1, max(y1 - 6, 14)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, col, 1, cv2.LINE_AA)
+
+        # AI FPS + TL state in corner
+        tl_s, _ = self.vision.last_tl_result()
+        tl_str  = f"TL:{tl_s.name}" if hasattr(tl_s, 'name') else str(tl_s)
+        tl_col  = (60, 220, 60) if tl_str.endswith("GREEN") else \
+                  (0, 200, 220) if tl_str.endswith("YELLOW") else \
+                  (50, 50, 220) if "RED" in tl_str or "DARK" in tl_str else \
+                  (170, 170, 170)
+        cv2.putText(viz, tl_str,
+                    (6, 22), cv2.FONT_HERSHEY_DUPLEX, 0.70, tl_col, 2, cv2.LINE_AA)
+        cv2.putText(viz, f"AI {self.vision.get_fps():.1f} fps",
+                    (6, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        cv2.imshow("Camera + AI", viz)
 
     def _show_debug(
         self,
@@ -392,16 +439,15 @@ class BFMCPilot:
         if self.dash_state is None:
             return
 
-        with self.vision_st.lock:
+        with self.vision_st.lock:    # FIX: always read obstacle under lock
             tl   = self.vision_st.traffic_light
             sign = self.vision_st.sign
             obs  = self.vision_st.obstacle
 
         obs_str = self.obs_hdlr.state
 
-        overlays: list = []
-        if sign is not None:
-            overlays.append((sign.sign_type, sign.confidence, sign.bbox))
+        # FIX: use vision.get_overlays() — includes BOTH TL bbox and sign bbox
+        overlays = self.vision.get_overlays()
 
         with self.dash_state.lock:
             self.dash_state.raw_frame        = frame
