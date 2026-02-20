@@ -423,7 +423,7 @@ class VisionAI:
         - Writes result to self._shared.<attr>
         - Tracks per-detector fps
         """
-        period = 1.0 / config.TARGET_FPS
+        period = 1.0 / config.AI_FPS   # pace at AI rate, NOT control-loop rate
 
         while self._running:
             t0 = time.monotonic()

@@ -179,9 +179,15 @@ MODEL_LANE_DIVIDER: str   = str(MODELS_DIR / "lane_divider.pt")  # disabled if f
 AI_INFER_W: int = 320
 AI_INFER_H: int = 240
 
+# AI detector target frame-rate (separate from control loop fps).
+# YOLO on Pi 5 achieves ~8-12 fps — set lower than that to avoid CPU starvation.
+# Increase if Pi handles it; decrease if main loop is starved.
+AI_FPS: int = 8   # detector thread run rate (Hz)
+
 # Confidence thresholds (0–1)
-CONF_TRAFFIC_LIGHT: float = 0.50
-CONF_ROAD_SIGN: float     = 0.55
+# Traffic light threshold lowered to 0.40 to catch dim/partial views.
+CONF_TRAFFIC_LIGHT: float = 0.40
+CONF_ROAD_SIGN: float     = 0.50
 CONF_LANE_DIVIDER: float  = 0.45
 CONF_OBSTACLE: float      = 0.50
 

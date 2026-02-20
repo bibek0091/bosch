@@ -88,13 +88,13 @@ class ImageProcessor:
             masked, self._M, (config.BEV_W, config.BEV_H)
         )
 
-        # Step 3: Convert to HLS; enhance L channel with CLAHE
+        # Step 3: Convert to HLS; enhance L (lightness) channel with CLAHE
+        # STRICT v2: only L channel is used — no S-channel augmentation.
         hls = cv2.cvtColor(warped_colour, cv2.COLOR_BGR2HLS)
         L   = self._clahe.apply(hls[:, :, 1])
-        S   = hls[:, :, 2]
 
-        # Step 4a: Adaptive threshold on L — good for white lines
-        binary_L = cv2.adaptiveThreshold(
+        # Step 4: Adaptive threshold on L channel — detects bright white lines
+        binary = cv2.adaptiveThreshold(
             L,
             255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -103,15 +103,7 @@ class ImageProcessor:
             config.ADAPT_C,
         )
 
-        # Step 4b: Simple threshold on S — picks up yellow / coloured lines
-        _, binary_S = cv2.threshold(
-            S, config.S_THRESH_LOW, 255, cv2.THRESH_BINARY
-        )
-
-        # Combine both binary channels
-        binary = cv2.bitwise_or(binary_L, binary_S)
-
-        # Step 5: Morphological close — fills gaps in dashed lane lines
+        # Step 5: Morphological close — fills gaps in dashed/dotted lane lines
         warped_binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, self._kernel)
 
         return warped_binary, warped_colour
