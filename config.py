@@ -185,11 +185,13 @@ AI_INFER_H: int = 240
 AI_FPS: int = 8   # detector thread run rate (Hz)
 
 # Confidence thresholds (0–1)
-# Traffic light threshold lowered to 0.40 to catch dim/partial views.
-CONF_TRAFFIC_LIGHT: float = 0.40
-CONF_ROAD_SIGN: float     = 0.50
-CONF_LANE_DIVIDER: float  = 0.45
-CONF_OBSTACLE: float      = 0.50
+# BFMC small-scale models at 1-2m distance produce lower scores than real-world training.
+# Lower thresholds to catch dim/partial views of miniature traffic lights and signs.
+# If too many false positives appear, raise CONF_TRAFFIC_LIGHT to 0.30 first.
+CONF_TRAFFIC_LIGHT: float = 0.20   # lowered from 0.40 — small TL models at close range
+CONF_ROAD_SIGN: float     = 0.25   # lowered from 0.50 — small sign models
+CONF_LANE_DIVIDER: float  = 0.40
+CONF_OBSTACLE: float      = 0.40
 
 # Sign class names (must match model's class indices)
 SIGN_CLASSES: dict[str, int] = {

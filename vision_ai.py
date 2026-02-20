@@ -153,7 +153,7 @@ class TrafficLightDetector:
     Min confidence for colour detection = COLOUR_CONF_MIN.
     """
 
-    COLOUR_CONF_MIN = 0.30   # lower = more sensitive (trade: more false positives)
+    COLOUR_CONF_MIN = 0.15   # lowered to match config.CONF_TRAFFIC_LIGHT for lab-scale TL models
 
     def __init__(self) -> None:
         self._model   = _load_model(config.MODEL_TRAFFIC_LIGHT, "traffic_light")
@@ -168,7 +168,9 @@ class TrafficLightDetector:
             return null
 
         h, w = frame.shape[:2]
-        resized = cv2.resize(frame, (config.AI_INFER_W, config.AI_INFER_H))
+        # CRITICAL FIX: YOLO expects RGB, OpenCV gives BGR. Red TL = blue without this!
+        rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (config.AI_INFER_W, config.AI_INFER_H))
         sx, sy  = w / config.AI_INFER_W, h / config.AI_INFER_H
 
         try:
@@ -240,7 +242,9 @@ class RoadSignDetector:
             return None
 
         h, w = frame.shape[:2]
-        resized = cv2.resize(frame, (config.AI_INFER_W, config.AI_INFER_H))
+        # CRITICAL FIX: YOLO expects RGB, OpenCV gives BGR. Red TL = blue without this!
+        rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (config.AI_INFER_W, config.AI_INFER_H))
         sx, sy  = w / config.AI_INFER_W, h / config.AI_INFER_H
 
         try:
@@ -289,7 +293,9 @@ class LaneDividerDetector:
             return None
 
         h, w    = frame.shape[:2]
-        resized = cv2.resize(frame, (config.AI_INFER_W, config.AI_INFER_H))
+        # CRITICAL FIX: convert BGR → RGB before YOLO inference
+        rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (config.AI_INFER_W, config.AI_INFER_H))
 
         try:
             results = self._model(resized, verbose=False,
@@ -339,7 +345,9 @@ class ObstacleDetector:
             return _no
 
         h, w    = frame.shape[:2]
-        resized = cv2.resize(frame, (config.AI_INFER_W, config.AI_INFER_H))
+        # CRITICAL FIX: convert BGR → RGB before YOLO inference
+        rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (config.AI_INFER_W, config.AI_INFER_H))
         sx, sy  = w / config.AI_INFER_W, h / config.AI_INFER_H
 
         try:
