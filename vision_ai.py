@@ -1,21 +1,23 @@
 """
 vision_ai.py — BFMC Autonomous Car System
 ==========================================
-AI inference module. Uses the raw forward-facing camera frame (NOT BEV).
+AI inference module. Runs on raw forward-facing camera frames (NOT BEV —
+lane detection and BEV are strictly handled by image_processing.py /
+lane_detection.py using the original CV pipeline).
 
-Four detectors, each in its own thread:
-  1. Traffic light  — TrafficLightState
-  2. Road sign      — SignDetection
-  3. Lane divider   — LaneDividerDetection  (CV supplement, not replacement)
-  4. Obstacle       — ObstacleDetection     (on zebra crossing)
+Four detectors, each in its own daemon thread:
+  1. TrafficLightDetector   → VisionState.traffic_light
+  2. RoadSignDetector       → VisionState.sign
+  3. LaneDividerDetector    → VisionState.lane_divider  (AI supplement, CV is primary)
+  4. ObstacleDetector       → VisionState.obstacle
 
-All results are written to a shared VisionState dataclass under a threading.Lock.
-The main loop reads VisionState non-blocking — stale values are fine.
+Model files — place in  bosch/models/
+  traffic_light.pt  — red / yellow / green + fixture class
+  road_sign.pt      — highway_entry, zebra, stop, highway_exit, parking, one_way
+  obstacle.pt       — pedestrian / object on crossing
+  lane_divider.pt   — (optional) lane divider supplement
 
-Model requirements:
-  - YOLO v8 / ultralytics compatible .pt files
-  - Paths configured in config.py (MODEL_TRAFFIC_LIGHT, etc.)
-  - If a model file is missing: detector is silently disabled
+Any missing .pt file is silently disabled — system runs CV-only.
 """
 
 from __future__ import annotations
@@ -72,37 +74,40 @@ def _scale_bbox(
     )
 
 
-def _load_model(path: str) -> Optional["YOLO"]:
-    """Load a YOLO model; return None if file missing or YOLO unavailable."""
+def _load_model(path: str, name: str) -> Optional["YOLO"]:
+    """
+    Load a YOLO .pt model from models/ folder.
+    Returns None if:  file missing, YOLO not installed, or load fails.
+    """
     if not _YOLO_AVAILABLE:
         return None
-    if not path or not Path(path).exists():
-        log.warning("vision_ai: model not found at '%s' — detector disabled", path)
+    p = Path(path)
+    if not path or not p.exists():
+        log.warning("vision_ai [%s]: model not found at '%s' — detector DISABLED", name, path)
         return None
     try:
-        model = YOLO(path)
-        log.info("vision_ai: loaded model '%s'", path)
+        model = YOLO(str(p))
+        log.info("vision_ai [%s]: loaded '%s'  (%.1f MB)",
+                 name, p.name, p.stat().st_size / 1e6)
         return model
     except Exception as exc:
-        log.warning("vision_ai: failed to load '%s': %s", path, exc)
+        log.warning("vision_ai [%s]: failed to load '%s': %s", name, path, exc)
         return None
 
 
 # ===========================================================================
-# TRAFFIC LIGHT DETECTOR
+# DETECTOR 1 — TRAFFIC LIGHT
 # ===========================================================================
 class TrafficLightDetector:
     """
-    Detects traffic light state from raw BGR frame.
+    Model:  models/traffic_light.pt
+    Classes (names dict in model):
+        traffic_light   whole fixture
+        red
+        yellow
+        green
 
-    Class names expected in the model:
-        0: traffic_light   (whole fixture)
-        1: red
-        2: yellow
-        3: green
-
-    Special rule: if the fixture bounding box is detected but no colour
-    sub-class is found → state = DARK (treat as RED).
+    If fixture is detected but no colour sub-class → DARK (treated as RED).
     """
 
     CLASS_FIXTURE = "traffic_light"
@@ -111,14 +116,15 @@ class TrafficLightDetector:
     CLASS_GREEN   = "green"
 
     def __init__(self) -> None:
-        self._model = _load_model(config.MODEL_TRAFFIC_LIGHT)
+        self._model   = _load_model(config.MODEL_TRAFFIC_LIGHT, "traffic_light")
         self._enabled = self._model is not None
+        if self._enabled:
+            log.info("TrafficLightDetector: ENABLED")
 
     def infer(self, frame: np.ndarray) -> TrafficLightState:
         if not self._enabled:
             return TrafficLightState.NONE
 
-        # Resize for speed
         resized = cv2.resize(frame, (config.AI_INFER_W, config.AI_INFER_H))
         try:
             results = self._model(resized, verbose=False,
@@ -127,8 +133,8 @@ class TrafficLightDetector:
             log.debug("TrafficLightDetector: inference error: %s", exc)
             return TrafficLightState.NONE
 
-        names  = results.names
-        boxes  = results.boxes
+        names = results.names
+        boxes = results.boxes
         if boxes is None or len(boxes) == 0:
             return TrafficLightState.NONE
 
@@ -146,26 +152,33 @@ class TrafficLightDetector:
         if has_red:
             return TrafficLightState.RED
         if fixture_seen:
-            # Light visible but no colour lit → treat as RED (safety)
-            return TrafficLightState.DARK
+            return TrafficLightState.DARK   # fixture seen, no colour lit → treat RED
 
         return TrafficLightState.NONE
 
 
 # ===========================================================================
-# ROAD SIGN DETECTOR
+# DETECTOR 2 — ROAD SIGN
 # ===========================================================================
 class RoadSignDetector:
     """
-    Detects road signs. Class indices defined in config.SIGN_CLASSES.
+    Model:  models/road_sign.pt
+    Class indices defined in config.SIGN_CLASSES:
+        0: HIGHWAY_ENTRY
+        1: ZEBRA_CROSSING
+        2: STOP_SIGN
+        3: HIGHWAY_EXIT
+        4: PARKING
+        5: ONE_WAY
     Returns the highest-confidence detection above threshold, or None.
     """
 
     def __init__(self) -> None:
-        self._model   = _load_model(config.MODEL_ROAD_SIGN)
-        self._enabled = self._model is not None
-        # Invert SIGN_CLASSES: index → name
+        self._model       = _load_model(config.MODEL_ROAD_SIGN, "road_sign")
+        self._enabled     = self._model is not None
         self._idx_to_name = {v: k for k, v in config.SIGN_CLASSES.items()}
+        if self._enabled:
+            log.info("RoadSignDetector: ENABLED  classes=%s", list(config.SIGN_CLASSES.keys()))
 
     def infer(self, frame: np.ndarray) -> Optional[SignDetection]:
         if not self._enabled:
@@ -191,30 +204,35 @@ class RoadSignDetector:
         clss   = boxes.cls.cpu().numpy().astype(int)
         xyxys  = boxes.xyxy.cpu().numpy()
 
-        best_idx = int(confs.argmax())
-        cls_id   = clss[best_idx]
+        best_idx  = int(confs.argmax())
+        cls_id    = clss[best_idx]
         sign_name = self._idx_to_name.get(cls_id, f"SIGN_{cls_id}")
-        bbox = _scale_bbox(tuple(xyxys[best_idx]), sx, sy)     # type: ignore[arg-type]
+        bbox      = _scale_bbox(tuple(xyxys[best_idx]), sx, sy)  # type: ignore[arg-type]
 
-        return SignDetection(
-            sign_type=sign_name,
-            confidence=float(confs[best_idx]),
-            bbox=bbox,
+        det = SignDetection(
+            sign_type  = sign_name,
+            confidence = float(confs[best_idx]),
+            bbox       = bbox,
         )
+        log.debug("Sign detected: %s  conf=%.2f", sign_name, det.confidence)
+        return det
 
 
 # ===========================================================================
-# LANE DIVIDER DETECTOR  (AI-assisted, CV primary)
+# DETECTOR 3 — LANE DIVIDER  (AI supplement — CV is primary, this is advisory)
 # ===========================================================================
 class LaneDividerDetector:
     """
-    AI-assisted lane divider detection. Supplements CV — does NOT replace it.
-    Returns estimated BEV x position and type.
+    Model:  models/lane_divider.pt   (optional)
+    Supplements the CV lane tracker — does NOT replace it.
+    Results are written to VisionState.lane_divider.
     """
 
     def __init__(self) -> None:
-        self._model   = _load_model(config.MODEL_LANE_DIVIDER)
+        self._model   = _load_model(config.MODEL_LANE_DIVIDER, "lane_divider")
         self._enabled = self._model is not None
+        if self._enabled:
+            log.info("LaneDividerDetector: ENABLED (advisory only — CV is primary)")
 
     def infer(self, frame: np.ndarray) -> Optional[LaneDividerDetection]:
         if not self._enabled:
@@ -234,70 +252,66 @@ class LaneDividerDetector:
         if boxes is None or len(boxes) == 0:
             return None
 
-        # Use the highest-confidence box; estimate x as bbox centre
         confs = boxes.conf.cpu().numpy()
         xyxys = boxes.xyxy.cpu().numpy()
         best  = int(confs.argmax())
         x1, _, x2, _ = xyxys[best]
-        sx = w_orig / config.AI_INFER_W
-        x_centre = float((x1 + x2) / 2.0 * sx)
+        sx            = w_orig / config.AI_INFER_W
+        x_centre      = float((x1 + x2) / 2.0 * sx)
 
         return LaneDividerDetection(
-            x_position=x_centre,
-            divider_type="unknown",
-            confidence=float(confs[best]),
+            x_position   = x_centre,
+            divider_type = "unknown",
+            confidence   = float(confs[best]),
         )
 
 
 # ===========================================================================
-# OBSTACLE DETECTOR
+# DETECTOR 4 — OBSTACLE (pedestrian / object on crossing)
 # ===========================================================================
 class ObstacleDetector:
     """
+    Model:  models/obstacle.pt
     Detects pedestrians / objects on the zebra crossing area.
-    Uses the road sign model (or a dedicated obstacle model from config).
-
-    Estimates which side of the frame the obstacle is on.
+    Estimates which third of the frame the obstacle occupies.
     """
 
-    PERSON_CLASS = "person"
-
     def __init__(self) -> None:
-        # Use dedicated model if it exists, otherwise fall back to sign model
-        path          = config.MODEL_OBSTACLE
-        self._model   = _load_model(path)
+        self._model   = _load_model(config.MODEL_OBSTACLE, "obstacle")
         self._enabled = self._model is not None
+        if self._enabled:
+            log.info("ObstacleDetector: ENABLED")
 
     def infer(self, frame: np.ndarray) -> ObstacleDetection:
+        _no_obs = ObstacleDetection(present=False, bbox=None,
+                                    estimated_side=ObstacleSide.NONE)
         if not self._enabled:
-            return ObstacleDetection(present=False, bbox=None,
-                                     estimated_side=ObstacleSide.NONE)
+            return _no_obs
 
-        w_orig = frame.shape[1]
+        w_orig  = frame.shape[1]
+        h_orig  = frame.shape[0]
         resized = cv2.resize(frame, (config.AI_INFER_W, config.AI_INFER_H))
-        sx = w_orig / config.AI_INFER_W
-        sy = frame.shape[0] / config.AI_INFER_H
+        sx      = w_orig / config.AI_INFER_W
+        sy      = h_orig / config.AI_INFER_H
 
         try:
             results = self._model(resized, verbose=False,
                                   conf=config.CONF_OBSTACLE)[0]
         except Exception as exc:
             log.debug("ObstacleDetector: inference error: %s", exc)
-            return ObstacleDetection(present=False, bbox=None,
-                                     estimated_side=ObstacleSide.NONE)
+            return _no_obs
 
         boxes = results.boxes
         if boxes is None or len(boxes) == 0:
-            return ObstacleDetection(present=False, bbox=None,
-                                     estimated_side=ObstacleSide.NONE)
+            return _no_obs
 
-        confs  = boxes.conf.cpu().numpy()
-        xyxys  = boxes.xyxy.cpu().numpy()
-        best   = int(confs.argmax())
+        confs        = boxes.conf.cpu().numpy()
+        xyxys        = boxes.xyxy.cpu().numpy()
+        best         = int(confs.argmax())
         x1, y1, x2, y2 = xyxys[best]
-        bbox   = _scale_bbox((x1, y1, x2, y2), sx, sy)
+        bbox         = _scale_bbox((x1, y1, x2, y2), sx, sy)
 
-        # Estimate which side the obstacle is on (thirds of frame)
+        # Which third of the frame?
         x_centre = (x1 + x2) / 2.0
         third    = config.AI_INFER_W / 3.0
         if x_centre < third:
@@ -307,6 +321,7 @@ class ObstacleDetector:
         else:
             side = ObstacleSide.CENTER
 
+        log.debug("Obstacle: side=%s  conf=%.2f", side.name, float(confs[best]))
         return ObstacleDetection(present=True, bbox=bbox, estimated_side=side)
 
 
@@ -315,147 +330,147 @@ class ObstacleDetector:
 # ===========================================================================
 class VisionAI:
     """
-    Co-ordinates all four detectors. Each runs in a daemon thread.
+    Co-ordinates four detector threads.
 
     Usage::
-
         vision = VisionAI()
-        shared_state = VisionState()
-        vision.start(shared_state)
+        state  = VisionState()
+        vision.start(state)         # spawns threads
 
-        # … main loop …
-        with shared_state.lock:
-            tl = shared_state.traffic_light
+        vision.push_frame(frame)    # call every main-loop tick
+
+        fps = vision.get_fps()      # float — average detector fps
 
         vision.stop()
     """
 
+    # Frame is shared between main thread (writer) and detector threads (readers)
+    _latest_frame: Optional[np.ndarray] = None
+    _frame_lock = threading.Lock()
+
     def __init__(self) -> None:
-        self._tl_det  = TrafficLightDetector()
+        self._tl_det   = TrafficLightDetector()
         self._sign_det = RoadSignDetector()
         self._div_det  = LaneDividerDetector()
         self._obs_det  = ObstacleDetector()
 
-        self._running        = False
+        self._running = False
         self._threads: list[threading.Thread] = []
-        self._shared: Optional[VisionState]   = None
+        self._shared:  Optional[VisionState]  = None
 
-        # FPS tracking per detector
-        self._fps: dict[str, float] = {
+        # Per-detector FPS tracking
+        self._fps_vals: dict[str, float] = {
             "traffic_light": 0.0,
             "sign":          0.0,
             "divider":       0.0,
             "obstacle":      0.0,
         }
 
+    # ------------------------------------------------------------------
     def start(self, shared_state: VisionState) -> None:
         """Start all detector threads, writing results to shared_state."""
         self._shared  = shared_state
         self._running = True
 
+        _enabled = []
         specs = [
-            ("traffic_light", self._tl_loop),
-            ("sign",          self._sign_loop),
-            ("divider",       self._div_loop),
-            ("obstacle",      self._obs_loop),
+            ("traffic_light", self._tl_loop,  self._tl_det._enabled),
+            ("sign",          self._sign_loop, self._sign_det._enabled),
+            ("divider",       self._div_loop,  self._div_det._enabled),
+            ("obstacle",      self._obs_loop,  self._obs_det._enabled),
         ]
-        for name, target in specs:
+        for name, target, enabled in specs:
             t = threading.Thread(target=target, name=f"VisionAI-{name}", daemon=True)
             t.start()
             self._threads.append(t)
+            if enabled:
+                _enabled.append(name)
+
+        if _enabled:
+            log.info("VisionAI: active detectors: %s", ", ".join(_enabled))
+        else:
+            log.warning("VisionAI: no detectors active (place .pt files in models/)")
         log.info("VisionAI: all detector threads started")
 
     def stop(self) -> None:
-        """Signal all threads to exit."""
         self._running = False
         for t in self._threads:
             t.join(timeout=1.0)
         log.info("VisionAI: stopped")
 
-    def get_fps(self) -> dict[str, float]:
-        return dict(self._fps)
-
-    # ------------------------------------------------------------------
-    # DETECTOR THREADS
-    # ------------------------------------------------------------------
-
-    def _run_detector(
-        self,
-        name: str,
-        infer_fn,
-        write_fn,
-    ) -> None:
-        """Generic detector loop: infer → write to shared state → pace."""
-        period = 1.0 / config.TARGET_FPS
-        t_fps  = time.monotonic()
-        while self._running:
-            t0    = time.monotonic()
-            frame = self._shared and self._shared  # access via camera below
-
-            # NOTE: frames are injected via set_frame(). See _tl_loop etc.
-            time.sleep(period)   # placeholder — real frame injection path below
-
-        # (Real implementation uses self._frame set by VisionAI.push_frame)
-
     def push_frame(self, frame: np.ndarray) -> None:
-        """
-        Called by main.py each tick to push the latest raw frame into
-        all detector threads.
-        """
-        self._latest_frame = frame
+        """Called by main.py every tick to inject the latest camera frame."""
+        with self._frame_lock:
+            self._latest_frame = frame
 
+    def get_fps(self) -> float:
+        """Returns average fps across all active detector threads."""
+        vals = [v for v in self._fps_vals.values() if v > 0]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    def get_fps_dict(self) -> dict[str, float]:
+        """Returns per-detector fps values."""
+        return dict(self._fps_vals)
+
+    # ------------------------------------------------------------------
+    # INTERNAL: generic detect loop
+    # ------------------------------------------------------------------
     def _detect_loop(self, name: str, infer_fn, attr: str) -> None:
         """
-        Reusable detector loop. Runs infer_fn on the latest frame and
-        writes the result to self._shared.<attr>.
+        Generic detector loop.
+        - Reads latest frame (push_frame sets it)
+        - Calls infer_fn(frame)
+        - Writes result to self._shared.<attr>
+        - Tracks per-detector fps
         """
         period = 1.0 / config.TARGET_FPS
+
         while self._running:
             t0 = time.monotonic()
-            frame = getattr(self, "_latest_frame", None)
+
+            with self._frame_lock:
+                frame = self._latest_frame
+
             if frame is not None and self._shared is not None:
                 try:
                     result = infer_fn(frame)
                     with self._shared.lock:
                         setattr(self._shared, attr, result)
                 except Exception as exc:
-                    log.debug("VisionAI [%s]: %s", name, exc)
+                    log.debug("VisionAI [%s] error: %s", name, exc)
 
-            # Pace to FPS
-            elapsed    = time.monotonic() - t0
-            sleep_t    = max(0.0, period - elapsed)
-            time.sleep(sleep_t)
+            # Pace + FPS tracking
+            elapsed = time.monotonic() - t0
+            time.sleep(max(0.0, period - elapsed))
 
-            # EMA FPS
-            dt = time.monotonic() - t0
-            self._fps[name] = 0.9 * self._fps[name] + 0.1 * (1.0 / max(dt, 1e-6))
+            total_dt = time.monotonic() - t0
+            self._fps_vals[name] = (
+                0.9 * self._fps_vals[name]
+                + 0.1 * (1.0 / max(total_dt, 1e-6))
+            )
 
-    def _tl_loop(self) -> None:
-        self._detect_loop("traffic_light", self._tl_det.infer, "traffic_light")
-
-    def _sign_loop(self) -> None:
-        self._detect_loop("sign", self._sign_det.infer, "sign")
-
-    def _div_loop(self) -> None:
-        self._detect_loop("divider", self._div_det.infer, "lane_divider")
-
-    def _obs_loop(self) -> None:
-        self._detect_loop("obstacle", self._obs_det.infer, "obstacle")
-
-    # Initial value so push_frame works before first call
-    _latest_frame: Optional[np.ndarray] = None
+    def _tl_loop(self)   -> None: self._detect_loop("traffic_light", self._tl_det.infer,   "traffic_light")
+    def _sign_loop(self) -> None: self._detect_loop("sign",          self._sign_det.infer,  "sign")
+    def _div_loop(self)  -> None: self._detect_loop("divider",       self._div_det.infer,   "lane_divider")
+    def _obs_loop(self)  -> None: self._detect_loop("obstacle",      self._obs_det.infer,   "obstacle")
 
 
 # ---------------------------------------------------------------------------
-# Smoke-test  (python vision_ai.py --sim)
+# Smoke-test
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import argparse, logging
+    import logging
     logging.basicConfig(level=logging.INFO)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--sim", action="store_true")
-    args = parser.parse_args()
+    # List models found
+    models_dir = Path(config.PROJECT_ROOT) / "models"
+    found = list(models_dir.glob("*.pt"))
+    if found:
+        print(f"Models found in {models_dir}:")
+        for m in found:
+            print(f"  {m.name}  ({m.stat().st_size / 1e6:.1f} MB)")
+    else:
+        print(f"No .pt models in {models_dir}  (detectors will be disabled)")
 
     state  = VisionState()
     vision = VisionAI()
@@ -469,10 +484,10 @@ if __name__ == "__main__":
         sign = state.sign
         obs  = state.obstacle
 
-    print(f"TrafficLight : {tl}")
-    print(f"Sign         : {sign}")
-    print(f"Obstacle     : {obs}")
-    print(f"Detector FPS : {vision.get_fps()}")
+    print(f"\nTrafficLight  : {tl}")
+    print(f"Sign          : {sign}")
+    print(f"Obstacle      : {obs}")
+    print(f"Detector FPS  : {vision.get_fps_dict()}")
 
     vision.stop()
-    print("vision_ai smoke-test DONE (all detectors disabled without models — expected)")
+    print("vision_ai smoke-test DONE")

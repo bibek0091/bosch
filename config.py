@@ -150,12 +150,30 @@ SERIAL_BAUD: int  = 115200
 
 # ===========================================================================
 # SECTION 10 — AI MODEL PATHS
-# Set to None or empty string to disable a detector gracefully.
+# All .pt files live in  bosch/models/
+# Set to empty string "" to disable a detector gracefully.
 # ===========================================================================
-MODEL_TRAFFIC_LIGHT: str = str(PROJECT_ROOT / "models" / "traffic_light.pt")
-MODEL_ROAD_SIGN: str     = str(PROJECT_ROOT / "models" / "road_sign.pt")
-MODEL_LANE_DIVIDER: str  = str(PROJECT_ROOT / "models" / "lane_divider.pt")
-MODEL_OBSTACLE: str      = str(PROJECT_ROOT / "models" / "obstacle.pt")
+MODELS_DIR = PROJECT_ROOT / "models"
+
+# ── Traffic light detector ─────────────────────────────────────────────────
+# Three weight variants — swap by changing the active line.
+MODEL_TRAFFIC_LIGHT: str  = str(MODELS_DIR / "traffic_light.pt")        # med  ~50 MB  (default)
+# MODEL_TRAFFIC_LIGHT: str = str(MODELS_DIR / "traffic_light_small.pt")  # small ~22 MB
+# MODEL_TRAFFIC_LIGHT: str = str(MODELS_DIR / "traffic_light_nano.pt")   # nano  ~6 MB (fastest for Pi)
+
+# ── Road sign / highway sign detector ─────────────────────────────────────
+# Two variants: best.pt (v1) and last.pt (v2) — both detect highway signs.
+# Use v1 by default; swap to v2 to compare.
+MODEL_ROAD_SIGN: str      = str(MODELS_DIR / "road_sign.pt")     # from best.pt  ~6 MB  (v1, default)
+# MODEL_ROAD_SIGN: str     = str(MODELS_DIR / "road_sign_v2.pt")  # from last.pt  ~6 MB  (v2 alternative)
+
+# ── Obstacle detector ─────────────────────────────────────────────────────
+# No dedicated obstacle .pt model supplied yet — detector disabled.
+# Drop an obstacle.pt into models/ to enable it automatically.
+MODEL_OBSTACLE: str       = ""   # empty = disabled
+
+# ── Lane divider (optional AI supplement — CV is primary) ─────────────────
+MODEL_LANE_DIVIDER: str   = str(MODELS_DIR / "lane_divider.pt")  # disabled if file missing
 
 # Inference resize (smaller = faster; bboxes are projected back to CAM_W x CAM_H)
 AI_INFER_W: int = 320

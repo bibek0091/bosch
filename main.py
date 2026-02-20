@@ -153,8 +153,11 @@ class BFMCPilot:
 
         # Dashboard window (main thread owns ALL cv2.imshow calls)
         if self.dash is not None:
+            blank = np.full((config.DASH_H, config.DASH_W, 3), (13, 14, 23), np.uint8)
             cv2.namedWindow("BFMC Dashboard", cv2.WINDOW_NORMAL)
+            cv2.imshow("BFMC Dashboard", blank)   # must imshow BEFORE resize on Linux Qt
             cv2.resizeWindow("BFMC Dashboard", config.DASH_W, config.DASH_H)
+            cv2.moveWindow("BFMC Dashboard", 0, 0)   # force on-screen top-left
 
         log.info("BFMCPilot: all sub-systems started (sim=%s)", self._sim_mode)
 
