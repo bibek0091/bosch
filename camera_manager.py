@@ -66,7 +66,8 @@ class CameraManager:
 
         # Pre-allocate blank fallback frame
         self._blank = np.zeros((config.CAM_H, config.CAM_W, 3), dtype=np.uint8)
-        self._frame_count: int = 0   # monotonic counter — useful for staleness check
+        self._frame_count: int = 0
+        self._heartbeat: float = 0.0  # Fix 38: Real-time watchdog heartbeat
 
         if not sim_mode:
             self._init_camera()
@@ -103,10 +104,6 @@ class CameraManager:
     def get_frame(self) -> np.ndarray:
         """
         Return a copy of the latest captured frame (BGR numpy array).
-
-        REAL-LIFE FIX: returns .copy() so callers cannot observe a
-        partially-written buffer if the capture thread updates it mid-read.
-        Picamera2 may also recycle the DMA buffer — copy guarantees ownership.
         """
         with self._lock:
             if self._frame is None:
@@ -117,6 +114,11 @@ class CameraManager:
     def frame_count(self) -> int:
         """Monotonically increasing counter — use to detect stale frames."""
         return self._frame_count
+
+    @property
+    def heartbeat(self) -> float:
+        """Fix 38: monotonic timestamp of last capture loop iteration."""
+        return self._heartbeat
 
     @property
     def is_camera_ok(self) -> bool:
@@ -156,15 +158,11 @@ class CameraManager:
         period = config.FRAME_PERIOD
         while self._running:
             t0 = time.monotonic()
+            self._heartbeat = t0  # Fix 38: Update heartbeat every iteration
 
             if self._cam_ok:
                 try:
                     raw = self._picam2.capture_array()
-                    # CRITICAL: Picamera2 always returns RGB (even with BGR888 config).
-                    # Convert to BGR once here so ALL downstream code is correct:
-                    #   - BEV processor : expects BGR for cv2 colour ops
-                    #   - YOLO detectors: we then do BGR→RGB before inference
-                    #   - Dashboard     : imshow expects BGR
                     bgr = cv2.cvtColor(np.array(raw, copy=True), cv2.COLOR_RGB2BGR)
                     with self._lock:
                         self._frame = bgr

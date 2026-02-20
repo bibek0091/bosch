@@ -62,51 +62,65 @@ class ImageProcessor:
     # PUBLIC API
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # PUBLIC API
+    # ------------------------------------------------------------------
+
     def process(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
         Convert a raw BGR camera frame to a binary BEV image.
-
-        Parameters
-        ----------
-        frame : np.ndarray
-            Raw BGR frame from CameraManager (shape CAM_H × CAM_W × 3).
-            This array is NOT modified.
-
-        Returns
-        -------
-        warped_binary : np.ndarray
-            Single-channel binary image (0 / 255) in BEV space.
-            Used as input for lane_detection.HybridLaneTracker.update().
-        warped_colour : np.ndarray
-            Colour (BGR) warped frame — used by dashboard for visualisation.
         """
-        # Step 1: Apply ROI mask — blacks out regions outside the road trapezoid
+        # Step 1: Apply ROI mask
         masked = cv2.bitwise_and(frame, frame, mask=self._roi_mask)
 
-        # Step 2: Warp the COLOUR frame first (avoid binary aliasing artefacts)
+        # Step 2: Warp the COLOUR frame
         warped_colour = cv2.warpPerspective(
             masked, self._M, (config.BEV_W, config.BEV_H)
         )
 
-        # Step 3: Convert to HLS; enhance L (lightness) channel with CLAHE
-        # STRICT v2: only L channel is used — no S-channel augmentation.
-        hls = cv2.cvtColor(warped_colour, cv2.COLOR_BGR2HLS)
-        L   = self._clahe.apply(hls[:, :, 1])
+        # Step 3: Perspective-space Binary Pipeline (Fix 29, 30, 31)
+        binary = self._get_binary(warped_colour)
 
-        # Step 4: Adaptive threshold on L channel — detects bright white lines
-        binary = cv2.adaptiveThreshold(
-            L,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            config.ADAPT_BLOCK_SIZE,
-            config.ADAPT_C,
-        )
-
-        # Step 5: Morphological close — fills gaps in dashed/dotted lane lines
+        # Step 4: Morphological close
         warped_binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, self._kernel)
 
         return warped_binary, warped_colour
+
+    def _get_binary(self, warped_bgr: np.ndarray) -> np.ndarray:
+        """
+        Fix 29, 30, 31: Multi-channel binary extraction.
+        Combines L-adaptive (whites), S-channel (yellows), and Sobel (edges).
+        """
+        hls = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2HLS)
+        L = hls[:, :, 1]
+        S = hls[:, :, 2]
+
+        # 1. L-channel Adaptive (Main White Line Detector)
+        L_enhanced = self._clahe.apply(L)
+        bin_l = cv2.adaptiveThreshold(
+            L_enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, config.ADAPT_BLOCK_SIZE, config.ADAPT_C
+        )
+
+        # 2. S-channel Threshold (Yellow Line Detector - Fix 29)
+        # Fix 31: Optional guard if S_THRESH_LOW is missing or None
+        s_thresh = getattr(config, "S_THRESH_LOW", 100)
+        _, bin_s = cv2.threshold(S, s_thresh, 255, cv2.THRESH_BINARY)
+
+        # 3. Sobel Gradient Magnitude (Edge Detector - Fix 30)
+        # Use L channel for gradient to avoid color noise
+        sobelx = cv2.Sobel(L, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(L, cv2.CV_64F, 0, 1, ksize=3)
+        # Fix 30: Use absolute magnitude
+        mag = np.sqrt(sobelx**2 + sobely**2)
+        mag_norm = np.uint8(255 * mag / np.max(mag)) if np.max(mag) > 0 else np.zeros_like(L)
+        _, bin_sobel = cv2.threshold(mag_norm, 40, 255, cv2.THRESH_BINARY) # fixed sensitivity
+
+        # Combine: OR all signals
+        combined = cv2.bitwise_or(bin_l, bin_s)
+        combined = cv2.bitwise_or(combined, bin_sobel)
+
+        return combined
 
     def get_perspective_matrix(self) -> np.ndarray:
         """Return the 3×3 perspective transform matrix (for external use)."""

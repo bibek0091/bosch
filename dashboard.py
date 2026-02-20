@@ -298,10 +298,15 @@ class Dashboard:
         g_cy = self.PANEL_TOP + 180
         g_r  = 115
         _draw_arc(c, cx, g_cy, g_r, -220, 40, C_GREY, 12)
-        max_sp = 200.0
+        
+        # Fix 35: Use config for max speed and label
+        max_sp = getattr(config, "DASH_MAX_SPEED", 200.0)
+        u_label = getattr(config, "DASH_SPEED_LABEL", "km/h")
+        
         pct    = min(speed / max_sp, 1.0)
         if pct > 0:
-            s_col   = C_RED if speed > 150 else (C_YELLOW if speed > 100 else C_BLUE)
+            # Fix 36: use config-ish thresholds
+            s_col   = C_RED if speed > (max_sp * 0.75) else (C_YELLOW if speed > (max_sp * 0.5) else C_BLUE)
             end_deg = -220 + int(260 * pct)
             _draw_arc(c, cx, g_cy, g_r, -220, end_deg, s_col, 12)
             tip_a = math.radians(end_deg)
@@ -314,15 +319,17 @@ class Dashboard:
 
         # Speed number
         _text(c, str(int(speed)), (cx, g_cy + 10), FONT_BOLD, 2.4, C_WHITE, 2, center=True)
-        _text(c, "km/h",          (cx, g_cy + 48), FONT,      0.52, C_DIMWHITE, 1, center=True)
+        _text(c, u_label,          (cx, g_cy + 48), FONT,      0.52, C_DIMWHITE, 1, center=True)
 
-        # Tick marks every 26°
+        # Tick marks
         for deg in range(-220, 41, 26):
             a  = math.radians(deg)
             p1 = (int(cx + (g_r-22)*math.cos(a)), int(g_cy+(g_r-22)*math.sin(a)))
             p2 = (int(cx + (g_r-8) *math.cos(a)), int(g_cy+(g_r-8) *math.sin(a)))
             cv2.line(c, p1, p2, C_GREY, 1)
-        for v in range(0, 201, 50):
+        
+        tick_step = int(max_sp / 4)
+        for v in range(0, int(max_sp) + 1, tick_step):
             deg = -220 + int(260 * v / max_sp)
             a   = math.radians(deg)
             lx  = int(cx + (g_r-38)*math.cos(a))

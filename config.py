@@ -72,23 +72,28 @@ TRACKER_POLY_MARGIN_CURV: int  = 120    # wider band when curvature is high
 TRACKER_MIN_PIX_OK: int        = 200    # min px to accept a line
 TRACKER_EMA_ALPHA: float       = 0.50   # polynomial EMA weight (higher = more responsive)
 TRACKER_STALE_FIT_FRAMES: int  = 5      # frames to hold stale polynomial before dropping
+TRACKER_HIST_SPLIT: float      = 0.50   # FIX 22: symmetric lane search midpoint
+TRACKER_MIN_LANE_WIDTH_PX: int = 80     # FIX 27: lower bound for _width_sane
+TRACKER_MAX_LANE_WIDTH_PX: int = 560    # FIX 27: upper bound for _width_sane
+TRACKER_DEFAULT_LANE_WIDTH_PX: int = 280 # FIX 41: default for trackbar/init
 
-# JunctionDetector
-JCT_ENTRY_FRAMES: int        = 5
-JCT_EXIT_FRAMES: int         = 8
+# ── JunctionDetector ───────────────────────────────────────────────────────
+# BFMC loop runs at ~20-30fps, so we use real-time seconds for timers.
+JCT_ENTRY_SECONDS: float      = 0.17    # ~5 frames at 30fps
+JCT_EXIT_SECONDS: float       = 0.27    # ~8 frames at 30fps
 JCT_CROSS_ENERGY_RATIO: float = 1.4
-JCT_WIDTH_RATIO_HIGH: float  = 1.6
-JCT_MIN_BOT_ENERGY: int      = 500
-JCT_MAX_FRAMES: int          = 150     # hard exit timeout
+JCT_WIDTH_RATIO_HIGH: float   = 1.6
+JCT_MIN_BOT_ENERGY: int       = 500
+JCT_MAX_SECONDS: float        = 5.0     # hard exit timeout
 
-# RoundaboutNavigator
-RBT_ENTRY_WIDTH_RATIO: float = 0.60
-RBT_ENTRY_FRAMES: int        = 5       # consecutive frames required to enter roundabout
-RBT_EXIT_WIDTH_RATIO: float  = 0.82
-RBT_MIN_CIRCLE_FRAMES: int   = 25
-RBT_MAX_CIRCLE_FRAMES: int   = 120
-RBT_SPEED_SCALE: float       = 0.50
-RBT_LOOKAHEAD_SCALE: float   = 0.55
+# ── RoundaboutNavigator ────────────────────────────────────────────────────
+RBT_ENTRY_WIDTH_RATIO: float  = 0.60
+RBT_ENTRY_SECONDS: float      = 0.17    # debounce before entering
+RBT_EXIT_WIDTH_RATIO: float   = 0.82
+RBT_MIN_CIRCLE_SECONDS: float = 0.83    # ~25 frames
+RBT_MAX_CIRCLE_SECONDS: float = 4.0     # ~120 frames
+RBT_SPEED_SCALE: float        = 0.50
+RBT_LOOKAHEAD_SCALE: float    = 0.55
 
 # ===========================================================================
 # SECTION 6 — STEERING CONTROL
@@ -121,6 +126,12 @@ HIGH_CURV_SCALE: float  = 0.60
 MED_CURV_SCALE: float   = 0.80
 DUAL_SPEED_SCALE: float = 1.15   # speed boost when both lines visible on straight
 
+# Safety Caps / Floors (FIX 13, 15)
+# Speed values sent to STM32 are throttle units 0–200, not km/h. 
+# Calibrate against measured wheel velocity if encoder feedback is available.
+HIGHWAY_MAX_SPEED: int      = 130   # prevents compound-multiplier overshoot
+MOTOR_STALL_THRESHOLD: int  = 15    # minimum throttle to prevent silent motor stall
+
 JUNCTION_SPEED_SCALE: float = 0.55
 HIGH_STEER_SCALE: float     = 0.60   # abs(steer) > HIGH_STEER_DEG
 MED_STEER_SCALE: float      = 0.80   # abs(steer) > MED_STEER_DEG
@@ -138,9 +149,9 @@ LA_MIN_PX: int             = 60      # absolute minimum look-ahead pixels
 # ===========================================================================
 # SECTION 8 — LOST-LANE POLICY
 # ===========================================================================
-LOST_GRACE_FRAMES: int   = 8      # frames before stopping
-LOST_STOP: bool          = False   # True = full stop after grace; False = creep
-LOST_CREEP_SPEED: float  = 25.0   # speed while creeping (LOST_STOP=False)
+LOST_GRACE_SECONDS: float = 0.27    # ~8 frames at 30fps
+LOST_STOP: bool           = False   # True = full stop after grace; False = creep
+LOST_CREEP_SPEED: float   = 25.0   # speed while creeping (LOST_STOP=False)
 
 # ===========================================================================
 # SECTION 9 — SERIAL CONFIG
@@ -155,47 +166,42 @@ SERIAL_BAUD: int  = 115200
 # ===========================================================================
 MODELS_DIR = PROJECT_ROOT / "models"
 
-# ── Traffic light detector ─────────────────────────────────────────────────
-# Three weight variants — swap by changing the active line.
-MODEL_TRAFFIC_LIGHT: str  = str(MODELS_DIR / "traffic_light.pt")        # med  ~50 MB  (default)
-# MODEL_TRAFFIC_LIGHT: str = str(MODELS_DIR / "traffic_light_small.pt")  # small ~22 MB
-# MODEL_TRAFFIC_LIGHT: str = str(MODELS_DIR / "traffic_light_nano.pt")   # nano  ~6 MB (fastest for Pi)
+# FIX 1 — Updated model filenames to match actual directory content.
+# Using 'traffic_light_small.pt' as default for better reliability than nano.
+MODEL_TRAFFIC_LIGHT: str  = str(MODELS_DIR / "traffic_light_small.pt")  # ~22 MB
+# MODEL_TRAFFIC_LIGHT: str = str(MODELS_DIR / "traffic_light_nano.pt")   # ~6 MB
+# MODEL_TRAFFIC_LIGHT: str = str(MODELS_DIR / "traffic_light.pt")        # ~50 MB
 
 # ── Road sign / highway sign detector ─────────────────────────────────────
 # ENSEMBLE: both models run simultaneously — highest confidence result is used.
-#   road_sign.pt   = best.pt  (YOLOv8n, v1 weights — good recall)
-#   road_sign_v2.pt = last.pt (YOLOv8n, v2 weights — better precision)
-# Set either to "" to disable that model; setting both "" disables sign detection.
-MODEL_ROAD_SIGN: str    = str(MODELS_DIR / "road_sign.pt")    # best.pt  ~6 MB
-MODEL_ROAD_SIGN_V2: str = str(MODELS_DIR / "road_sign_v2.pt") # last.pt  ~6 MB
+#   road_sign.pt    (YOLOv8n, v1 weights — good recall)
+#   road_sign_v2.pt (YOLOv8n, v2 weights — better precision)
+MODEL_ROAD_SIGN: str    = str(MODELS_DIR / "road_sign.pt")
+MODEL_ROAD_SIGN_V2: str = str(MODELS_DIR / "road_sign_v2.pt")
 
 # ── Obstacle detector ─────────────────────────────────────────────────────
-# No dedicated obstacle .pt model supplied yet — detector disabled.
-# Drop an obstacle.pt into models/ to enable it automatically.
 MODEL_OBSTACLE: str       = ""   # empty = disabled
 
 # ── Lane divider (optional AI supplement — CV is primary) ─────────────────
-MODEL_LANE_DIVIDER: str   = str(MODELS_DIR / "lane_divider.pt")  # disabled if file missing
+MODEL_LANE_DIVIDER: str   = str(MODELS_DIR / "lane_divider.pt")
 
-# Inference resize (smaller = faster; bboxes are projected back to CAM_W x CAM_H)
-AI_INFER_W: int = 320
-AI_INFER_H: int = 240
+# FIX 6 — BFMC miniature signs require full resolution — do not reduce below 416×416
+AI_INFER_W: int = 640
+AI_INFER_H: int = 480
 
-# AI detector target frame-rate (separate from control loop fps).
-# YOLO on Pi 5 achieves ~8-12 fps — set lower than that to avoid CPU starvation.
-# Increase if Pi handles it; decrease if main loop is starved.
+# AI detector target frame-rate
 AI_FPS: int = 8   # detector thread run rate (Hz)
 
+# FIX 38 — Watchdog on background threads (seconds)
+WATCHDOG_TIMEOUT_S: float = 2.0
+
 # Confidence thresholds (0–1)
-# BFMC small-scale models at 1-2m distance produce lower scores than real-world training.
-# Lower thresholds to catch dim/partial views of miniature traffic lights and signs.
-# If too many false positives appear, raise CONF_TRAFFIC_LIGHT to 0.30 first.
-CONF_TRAFFIC_LIGHT: float = 0.20   # lowered from 0.40 — small TL models at close range
-CONF_ROAD_SIGN: float     = 0.25   # lowered from 0.50 — small sign models
+CONF_TRAFFIC_LIGHT: float = 0.20   # catch miniature lights at distance
+CONF_ROAD_SIGN: float     = 0.25   # catch small sign models
 CONF_LANE_DIVIDER: float  = 0.40
 CONF_OBSTACLE: float      = 0.40
 
-# Sign class names (must match model's class indices)
+# Sign class names
 SIGN_CLASSES: dict[str, int] = {
     "HIGHWAY_ENTRY":   0,
     "ZEBRA_CROSSING":  1,
@@ -208,25 +214,25 @@ SIGN_CLASSES: dict[str, int] = {
 # ===========================================================================
 # SECTION 11 — BEHAVIOR ENGINE THRESHOLDS
 # ===========================================================================
-# Traffic light debounce
-TL_DEBOUNCE_FRAMES: int     = 5    # N consecutive frames to confirm state
-TL_GREEN_CONFIRM_FRAMES: int = 8   # M consecutive GREEN frames to resume after RED
+# Traffic light
+TL_DEBOUNCE_SECONDS: float      = 0.17    # confirm state (5 frames at 30fps)
+TL_GREEN_CONFIRM_SECONDS: float = 0.27    # confirmation to resume (8 frames)
 
 # Zebra crossing
-ZEBRA_APPROACH_SPEED_SCALE: float = 0.40  # slow down when sign seen
-ZEBRA_CLEAR_FRAMES: int           = 30    # frames with no obstacle → resume
+ZEBRA_APPROACH_SPEED_SCALE: float = 0.40
+ZEBRA_CLEAR_SECONDS: float        = 1.0   # resume after 1s of clear sign/obstacle
 
 # Obstacle / detour
-DETOUR_OFFSET_PX: int    = 80    # lane offset when detouring around obstacle
-DETOUR_HOLD_FRAMES: int  = 45    # min frames to hold offset after obstacle clears
-DETOUR_RAMP_FRAMES: int  = 20    # frames to smoothly ramp offset back to 0
+DETOUR_OFFSET_PX: int     = 80
+DETOUR_HOLD_SECONDS: float = 1.5   # ~45 frames
+DETOUR_RAMP_SECONDS: float = 0.67  # ~20 frames
 
 # Highway mode
-HIGHWAY_SPEED_FACTOR: float = 1.40   # multiply base_speed in HIGHWAY_MODE
-HIGHWAY_HOLD_FRAMES: int    = 150    # maintain highway mode for N frames
+HIGHWAY_SPEED_FACTOR: float = 1.40
+HIGHWAY_HOLD_SECONDS: float = 5.0
 
 # Stop sign
-STOP_SIGN_HOLD_FRAMES: int = 90     # full stop duration (frames at 30fps ≈ 3s)
+STOP_SIGN_HOLD_SECONDS: float = 3.0
 
 # ===========================================================================
 # SECTION 12 — DASHBOARD
@@ -279,11 +285,34 @@ HONK_SERIAL_CMD: str = "HONK"
 # ---------------------------------------------------------------------------
 # Smoke-test
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# STARTUP VALIDATION (FIX 1)
+# ---------------------------------------------------------------------------
+def validate_model_paths() -> bool:
+    """Check that all configured model paths exist on disk. Logs errors if not."""
+    import logging
+    l = logging.getLogger("config")
+    all_ok = True
+    for name, path_str in [
+        ("Traffic Light", MODEL_TRAFFIC_LIGHT),
+        ("Road Sign V1", MODEL_ROAD_SIGN),
+        ("Road Sign V2", MODEL_ROAD_SIGN_V2),
+        ("Lane Divider", MODEL_LANE_DIVIDER),
+    ]:
+        if not path_str: continue
+        p = Path(path_str)
+        if not p.exists():
+            l.error("FIX 1 CRITICAL: %s model MISSING! Expected at: %s", name, p.absolute())
+            all_ok = False
+    if all_ok:
+        l.info("AI Model Paths: ALL VALIDATED")
+    return all_ok
+
+
 if __name__ == "__main__":
     print("config.py — sanity check")
+    validate_model_paths()
     print(f"  CAM: {CAM_W}x{CAM_H} @ {TARGET_FPS}fps")
     print(f"  BEV: {BEV_W}x{BEV_H}")
-    print(f"  SRC_PTS: {SRC_PTS.tolist()}")
-    print(f"  Models dir: {PROJECT_ROOT / 'models'}")
     print(f"  AI models: traffic={MODEL_TRAFFIC_LIGHT}")
     print("  All constants loaded OK.")

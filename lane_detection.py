@@ -143,54 +143,56 @@ class HybridLaneTracker:
     ) -> tuple[Optional[float], str]:
         """
         Compute the BEV x-pixel the car should steer toward.
-
-        Returns (target_x, anchor_label).
-        target_x is None when the lane is completely lost.
+        Fix 28: Guards for None polynomial evaluation.
         """
         sl = self.sl
         sr = self.sr
         hw = lane_width_px / 2.0
 
-        def ev(fit: np.ndarray) -> float:
+        def ev(fit: Optional[np.ndarray]) -> Optional[float]:
+            if fit is None: return None
             return float(np.polyval(fit, y_eval))
 
+        xl = ev(sl)
+        xr = ev(sr)
+
         if nav_state == "ROUNDABOUT":
-            if sl is not None:
-                return ev(sl) + hw + extra_offset_px, "RBT_INNER"
-            if sr is not None:
-                return ev(sr) - hw + extra_offset_px, "RBT_OUTER"
+            if xl is not None:
+                return xl + hw + extra_offset_px, "RBT_INNER"
+            if xr is not None:
+                return xr - hw + extra_offset_px, "RBT_OUTER"
             return None, "RBT_LOST"
 
         if nav_state == "JUNCTION":
-            if sr is not None:
-                return ev(sr) - hw + extra_offset_px, "JCT_EDGE"
-            if sl is not None:
-                return ev(sl) + hw + extra_offset_px, "JCT_DIV"
+            if xr is not None:
+                return xr - hw + extra_offset_px, "JCT_EDGE"
+            if xl is not None:
+                return xl + hw + extra_offset_px, "JCT_DIV"
             return None, "JCT_LOST"
 
-        # NORMAL right-lane driving
-        if sl is not None and sr is not None:
-            return (ev(sl) + ev(sr)) / 2.0 + config.DUAL_OFFSET_PX, "DUAL"
+        # NORMAL right-lane driving (Fix 24: ensure xl and xr are valid)
+        if xl is not None and xr is not None:
+            return (xl + xr) / 2.0 + config.DUAL_OFFSET_PX, "DUAL"
 
-        if sr is not None and sl is None:
-            ghost_sl = sr - np.array([0.0, 0.0, float(lane_width_px)])
-            return (ev(ghost_sl) + ev(sr)) / 2.0 + config.SINGLE_EDGE_OFFSET_PX, "GHOST_L"
+        if xr is not None and xl is None:
+            ghost_xl = xr - lane_width_px
+            return (ghost_xl + xr) / 2.0 + config.SINGLE_EDGE_OFFSET_PX, "GHOST_L"
 
-        if sl is not None and sr is None:
-            ghost_sr = sl + np.array([0.0, 0.0, float(lane_width_px)])
-            return (ev(sl) + ev(ghost_sr)) / 2.0 + config.SINGLE_DIV_OFFSET_PX, "GHOST_R"
+        if xl is not None and xr is None:
+            ghost_xr = xl + lane_width_px
+            return (xl + ghost_xr) / 2.0 + config.SINGLE_DIV_OFFSET_PX, "GHOST_R"
 
         return None, "LOST"
 
     def get_curvature(self, y_eval: int) -> float:
         """
-        Return the absolute curvature (1/radius) of the best available line.
-        curvature = |2a| / (1 + (2ay+b)^2)^1.5
-        Returns 0.0 when no polynomial is available.
+        vature = |2a| / (1 + (2ay+b)^2)^1.5
         """
         fit = self.sr if self.sr is not None else self.sl
         if fit is None:
             return 0.0
+        # Fix 23 corollary: ensure fit has 3 coeffs for degree-2
+        if len(fit) < 3: return 0.0
         a, b  = fit[0], fit[1]
         num   = abs(2.0 * a)
         denom = (1.0 + (2.0 * a * y_eval + b) ** 2) ** 1.5
@@ -217,20 +219,26 @@ class HybridLaneTracker:
         nzy: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         dbg  = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
-        hist = np.sum(warped[self.h // 2:, :], axis=0)
+        
+        # Fix 25: use bottom half for histogram
+        y_start = self.h // 2
+        hist = np.sum(warped[y_start:, :], axis=0)
 
-        mid    = int(self.w * 0.40)
+        # Fix 22: Histogram split via TRACKER_HIST_SPLIT
+        split_frac = getattr(config, "TRACKER_HIST_SPLIT", 0.5)
+        mid = int(self.w * split_frac)
         margin = self.SW_MARGIN
 
-        lb = int(np.argmax(hist[margin:mid - margin])) + margin
-        rb = int(np.argmax(hist[mid + margin:self.w - margin])) + mid + margin
+        # Peak detection with margin
+        lb = int(np.argmax(hist[margin : mid - margin])) + margin
+        rb = int(np.argmax(hist[mid + margin : self.w - margin])) + mid + margin
 
-        # Collision fallback: peaks too close → find two strongest globally
+        # Peak collision fallback
         if abs(rb - lb) < 100:
             smoothed = np.convolve(hist.astype(float), np.ones(20) / 20, mode="same")
             p1  = int(np.argmax(smoothed))
             tmp = smoothed.copy()
-            tmp[max(0, p1 - 40):min(self.w, p1 + 40)] = 0
+            tmp[max(0, p1 - 50):min(self.w, p1 + 50)] = 0
             p2  = int(np.argmax(tmp))
             lb, rb = (min(p1, p2), max(p1, p2))
 
@@ -241,10 +249,8 @@ class HybridLaneTracker:
         for win in range(self.NWINDOWS):
             y_lo = self.h - (win + 1) * wh
             y_hi = self.h - win * wh
-            xl0  = max(0, lx - self.SW_MARGIN)
-            xl1  = min(self.w, lx + self.SW_MARGIN)
-            xr0  = max(0, rx - self.SW_MARGIN)
-            xr1  = min(self.w, rx + self.SW_MARGIN)
+            xl0, xl1 = max(0, lx - margin), min(self.w, lx + margin)
+            xr0, xr1 = max(0, rx - margin), min(self.w, rx + margin)
 
             cv2.rectangle(dbg, (xl0, y_lo), (xl1, y_hi), (0, 255, 0), 2)
             cv2.rectangle(dbg, (xr0, y_lo), (xr1, y_hi), (0, 255, 0), 2)
@@ -255,18 +261,14 @@ class HybridLaneTracker:
             li.append(gl)
             ri.append(gr)
 
-            if len(gl) > self.MINPIX:
-                lx = int(np.mean(nzx[gl]))
-            if len(gr) > self.MINPIX:
-                rx = int(np.mean(nzx[gr]))
+            if len(gl) > self.MINPIX: lx = int(np.mean(nzx[gl]))
+            if len(gr) > self.MINPIX: rx = int(np.mean(nzx[gr]))
 
-        li = np.concatenate(li)
-        ri = np.concatenate(ri)
+        li = np.concatenate(li) if li else np.array([], dtype=int)
+        ri = np.concatenate(ri) if ri else np.array([], dtype=int)
 
-        if len(li):
-            dbg[nzy[li], nzx[li]] = [255, 80, 80]
-        if len(ri):
-            dbg[nzy[ri], nzx[ri]] = [80, 80, 255]
+        if len(li): dbg[nzy[li], nzx[li]] = [255, 80, 80]
+        if len(ri): dbg[nzy[ri], nzx[ri]] = [80, 80, 255]
         return li, ri, dbg
 
     def _poly_search(
@@ -276,33 +278,33 @@ class HybridLaneTracker:
         nzy: np.ndarray,
         curvature: float = 0.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Fix 28: polynomial existence guards."""
         dbg = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
         m   = self.POLY_MARGIN_CURV if curvature > 0.0015 else self.POLY_MARGIN_BASE
 
-        def band(fit: np.ndarray) -> np.ndarray:
+        def band(fit: Optional[np.ndarray]) -> np.ndarray:
+            if fit is None: return np.array([], dtype=int)
             cx = np.polyval(fit, nzy)
             return ((nzx > cx - m) & (nzx < cx + m)).nonzero()[0]
 
-        li = band(self.sl) if self.sl is not None else np.array([], dtype=int)
-        ri = band(self.sr) if self.sr is not None else np.array([], dtype=int)
+        li = band(self.sl)
+        ri = band(self.sr)
 
         if len(li) < self.MIN_PIX_OK and len(ri) < self.MIN_PIX_OK:
             self.mode = "SEARCH"
             return self._sliding_window(warped, nzx, nzy)
 
-        if len(li):
-            dbg[nzy[li], nzx[li]] = [255, 80, 80]
-        if len(ri):
-            dbg[nzy[ri], nzx[ri]] = [80, 80, 255]
+        if len(li): dbg[nzy[li], nzx[li]] = [255, 80, 80]
+        if len(ri): dbg[nzy[ri], nzx[ri]] = [80, 80, 255]
         return li, ri, dbg
 
     def _width_sane(self, lf: np.ndarray, rf: np.ndarray) -> bool:
-        """Check that measured lane width at bottom of BEV is within plausible bounds.
-        FIX: was hardcoded y=400 — now uses config.BEV_H - 50 so it adapts to resolution.
-        """
+        """Fix 27: use config bounds."""
         y = config.BEV_H - 50
         w = np.polyval(rf, y) - np.polyval(lf, y)
-        return 60 < w < 600    # widen tolerance slightly for calibration drift
+        min_w = getattr(config, "TRACKER_MIN_LANE_WIDTH_PX", 120)
+        max_w = getattr(config, "TRACKER_MAX_LANE_WIDTH_PX", 500)
+        return min_w < w < max_w
 
     def _ema(self, prev: Optional[np.ndarray], new: np.ndarray) -> np.ndarray:
         if prev is None:

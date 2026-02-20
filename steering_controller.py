@@ -193,13 +193,6 @@ class SteeringEMA:
 class SpeedPolicy:
     """
     Rules-based speed selector.
-
-    Priority (highest first):
-      1. behavior_command overrides  (FULL_STOP → 0, SLOW → multiplier, HIGHWAY → multiplier)
-      2. Lost-lane grace period
-      3. nav_state  (roundabout / junction)
-      4. Curvature
-      5. Anchor mode + steer angle
     """
 
     def compute_speed(
@@ -221,7 +214,13 @@ class SpeedPolicy:
         if behavior_cmd is not None:
             if behavior_cmd.mode == BehaviorMode.FULL_STOP:
                 return 0.0
+            
             effective_base = base_speed * behavior_cmd.speed_multiplier
+            
+            # Fix 14: Highway max speed enforcement
+            if behavior_cmd.mode == BehaviorMode.HIGHWAY:
+                h_max = getattr(config, "HIGHWAY_MAX_SPEED", 120.0)
+                effective_base = min(effective_base, h_max)
         else:
             effective_base = base_speed
 
@@ -229,8 +228,9 @@ class SpeedPolicy:
         if config.LOST_STOP and lost_frames > config.LOST_GRACE_FRAMES:
             return 0.0
 
-        # --- Base = 0 ---
-        if effective_base == 0:
+        # --- Base = 0 or Below Stall Threshold (Fix 15) ---
+        stall_limit = getattr(config, "MOTOR_STALL_THRESHOLD", 30.0)
+        if effective_base < stall_limit:
             return 0.0
 
         # --- Nav state ---
@@ -262,6 +262,10 @@ class SpeedPolicy:
         if guard_on:
             speed *= guard_spd
 
+        # Fix 15: Final stall check after all scaling
+        if speed < stall_limit:
+            return 0.0
+
         return float(max(0.0, min(200.0, speed)))
 
 
@@ -270,16 +274,7 @@ class SpeedPolicy:
 # ===========================================================================
 class SteeringController:
     """
-    Thin façade that bundles all four steering sub-systems into one object,
-    mirroring the per-frame logic from BFMC_Pilot.run().
-
-    Usage in main.py::
-
-        ctrl = SteeringController()
-        steer = ctrl.compute_steer(target_x, eff_la, lane_width_px)
-        steer = ctrl.apply_guard(steer, sl, sr, y_eval)
-        speed = ctrl.compute_speed(base_speed, nav_state, anchor,
-                                   steer, curvature, lost_frames, behavior_cmd)
+    Thin façade that bundles all steering sub-systems.
     """
 
     def __init__(self) -> None:
@@ -296,11 +291,22 @@ class SteeringController:
         target_x:     float,
         look_ahead_px: int,
         lane_width_px: int,
+        nav_state:    str = "NORMAL",
     ) -> float:
-        """Pure pursuit → EMA smooth → rate-limited steering angle."""
-        raw     = self._pp.compute_steer(target_x, look_ahead_px, lane_width_px)
+        """
+        Pure pursuit → EMA smooth → rate-limited steering angle.
+        Fix 16: Scale lookahead if in roundabout.
+        """
+        la = float(look_ahead_px)
+        if nav_state == "ROUNDABOUT":
+            la_scale = getattr(config, "RBT_LOOKAHEAD_SCALE", 1.2)
+            la *= la_scale
+
+        raw     = self._pp.compute_steer(target_x, int(la), lane_width_px)
         smooth  = self._ema.update(raw)
         limited = self._limiter.apply(smooth)
+        
+        # Guard: always clip to MAX_STEER (Fix 17)
         return float(max(-config.MAX_STEER, min(config.MAX_STEER, limited)))
 
     def apply_guard(

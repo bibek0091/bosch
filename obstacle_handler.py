@@ -46,20 +46,13 @@ class ObstacleHandler:
         self,
         obstacle:  Optional[ObstacleDetection],
         lane_width_px: int = 280,
-    ) -> int:
+    ) -> tuple[int, Optional[BehaviorCommand]]:
         """
-        Returns the recommended lateral offset (pixels, signed) to apply to
-        the lane target.
-
-        Positive = shift target right (steer right).
-        Negative = shift target left (steer left).
-
-        Parameters
-        ----------
-        obstacle      : latest ObstacleDetection from VisionAI
-        lane_width_px : calibrated lane width in BEV pixels (for scaling)
+        Returns (lateral_offset_px, optional_behavior_command).
+        Fix 21: Returns BehaviorMode.FULL_STOP if obstacle is CENTER.
         """
         has_obstacle = obstacle is not None and obstacle.present
+        cmd: Optional[BehaviorCommand] = None
 
         # ----------------------------------------------------------------
         # ACTIVE OBSTACLE → engage or maintain detour
@@ -69,23 +62,25 @@ class ObstacleHandler:
 
             if side == ObstacleSide.LEFT:
                 self._target_offset = config.DETOUR_OFFSET_PX
+                self._state = "DETOURING"
             elif side == ObstacleSide.RIGHT:
                 self._target_offset = -config.DETOUR_OFFSET_PX
+                self._state = "DETOURING"
             else:
-                # CENTER — keep car stopped (no offset); caller handles the stop
+                # CENTER — Fix 21: Hard stop
                 self._target_offset = 0
+                self._state = "DETOURING"
+                cmd = BehaviorCommand(mode=BehaviorMode.FULL_STOP, speed_multiplier=0.0)
 
             self._hold_frames_left = config.DETOUR_HOLD_FRAMES
-            self._ramp_frames_left = 0        # FIX: don't set ramp here; set it in HOLDING→RAMPING
-            self._state            = "DETOURING"
+            self._ramp_frames_left = 0
             self._current_offset   = self._target_offset
-            return self._current_offset
+            return self._current_offset, cmd
 
         # ----------------------------------------------------------------
         # NO OBSTACLE — work through hold → ramp → clear
         # ----------------------------------------------------------------
         if self._state == "DETOURING":
-            # Obstacle just cleared → enter hold phase
             self._state            = "HOLDING"
             self._hold_frames_left = config.DETOUR_HOLD_FRAMES
             self._ramp_frames_left = config.DETOUR_RAMP_FRAMES
@@ -95,33 +90,25 @@ class ObstacleHandler:
         if self._state == "HOLDING":
             if self._hold_frames_left > 0:
                 self._hold_frames_left -= 1
-                return self._current_offset  # hold offset unchanged
             else:
                 self._state            = "RAMPING"
-                # FIX: set ramp_frames_left here (not in the DETOURING transition above)
                 self._ramp_frames_left = config.DETOUR_RAMP_FRAMES
                 log.debug("ObstacleHandler: entering RAMP phase (%d frames)",
                           self._ramp_frames_left)
 
         if self._state == "RAMPING":
             if self._ramp_frames_left > 0:
-                # FIX: always ramp TOWARD zero regardless of offset sign.
-                # Previous code subtracted step, which was wrong when target_offset < 0:
-                #   offset = -60, step = -60/20 = -3 → offset -= -3 → -57 (WRONG, increases magnitude)
-                # Correct: move current_offset toward 0 by abs(step) in the right direction.
                 n_frames = max(config.DETOUR_RAMP_FRAMES, 1)
-                step = self._current_offset / n_frames   # signed, correct direction
+                step = self._current_offset / n_frames
                 self._current_offset -= int(step)
                 self._ramp_frames_left -= 1
-                return self._current_offset
             else:
                 self._current_offset = 0
                 self._target_offset  = 0
                 self._state          = "CLEAR"
                 log.info("ObstacleHandler: offset ramped to zero")
 
-        # CLEAR
-        return 0
+        return self._current_offset, None
 
     def reset(self) -> None:
         """Immediately zero the offset (e.g., at startup or after a full stop)."""

@@ -99,22 +99,27 @@ def _load_model(path: str, name: str) -> Optional["YOLO"]:
 
 def _norm_class_name(raw: str) -> str:
     """
-    Normalise a raw class name from any model to one of the canonical tokens:
-      'red', 'yellow', 'green', 'traffic_light',
-      or the upper-cased underscore version for signs.
-
-    Handles: case differences, spaces, numbered IDs, partial matches.
+    Normalise a raw class name from any model to one of the canonical tokens.
+    Fix 4: Priority check on 'red/yellow/green' before generic 'traffic light'.
+    Added 'dark', 'off', 'unlit' mappings.
     """
     s = raw.lower().strip()
-    # Traffic light colours
+    
+    # Traffic light colours (Exact color detection takes priority over generic fixture)
     if any(k in s for k in ("red", "stop_light")):
         return "red"
     if any(k in s for k in ("yellow", "amber")):
         return "yellow"
     if any(k in s for k in ("green", "go_light")):
         return "green"
-    if any(k in s for k in ("traffic", "light", "signal", "tl", "fixture")):
+    
+    # Generic fixture or dark states
+    if any(k in s for k in ("traffic", "light", "signal", "tl", "fixture", "off", "dark", "unlit")):
+        # Guard: check if it's just 'light' which might be too generic
+        if s == "light" or s == "signal":
+            return "traffic_light"
         return "traffic_light"
+
     # Sign / obstacle: return normalised upper_case
     return raw.upper().replace(" ", "_").replace("-", "_")
 
@@ -147,13 +152,10 @@ class AIOverlayState:
 class TrafficLightDetector:
     """
     Robust to any model class naming convention.
-    Returns (TrafficLightState, bbox_or_None) — bbox in original frame coords.
-
-    Priority: GREEN > YELLOW > RED > DARK (fixture with no lit colour).
-    Min confidence for colour detection = COLOUR_CONF_MIN.
+    Priority: RED > YELLOW > GREEN > DARK (Fix 5 reversed from G>Y>R).
     """
 
-    COLOUR_CONF_MIN = 0.15   # lowered to match config.CONF_TRAFFIC_LIGHT for lab-scale TL models
+    COLOUR_CONF_MIN = 0.15
 
     def __init__(self) -> None:
         self._model   = _load_model(config.MODEL_TRAFFIC_LIGHT, "traffic_light")
@@ -168,7 +170,6 @@ class TrafficLightDetector:
             return null
 
         h, w = frame.shape[:2]
-        # CRITICAL FIX: YOLO expects RGB, OpenCV gives BGR. Red TL = blue without this!
         rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         resized = cv2.resize(rgb, (config.AI_INFER_W, config.AI_INFER_H))
         sx, sy  = w / config.AI_INFER_W, h / config.AI_INFER_H
@@ -176,8 +177,8 @@ class TrafficLightDetector:
         try:
             results = self._model(resized, verbose=False,
                                   conf=self.COLOUR_CONF_MIN)[0]
-        except Exception as exc:
-            log.debug("TL infer error: %s", exc)
+        except Exception:
+            log.warning("TL infer error", exc_info=True)  # Fix 3
             return null
 
         names = results.names
@@ -189,23 +190,21 @@ class TrafficLightDetector:
         conf_arr = boxes.conf.cpu().numpy()
         xyxy_arr = boxes.xyxy.cpu().numpy()
 
-        # Build list of (conf, normalised_token, bbox)
         mapped = []
         for cls_id, conf, xyxy in zip(cls_arr, conf_arr, xyxy_arr):
             token = _norm_class_name(str(names.get(int(cls_id), cls_id)))
             bbox  = _scale_bbox(tuple(xyxy), sx, sy)
             mapped.append((float(conf), token, bbox))
 
-        # Best detection per class (highest conf wins)
         best: dict[str, tuple[float, tuple]] = {}
         for conf, token, bbox in mapped:
             if token not in best or conf > best[token][0]:
                 best[token] = (conf, bbox)
 
-        # Priority: GREEN > YELLOW > RED > DARK
-        for token, state in [("green",        TrafficLightState.GREEN),
+        # Priority: RED > YELLOW > GREEN (Fix 5: Safety priority)
+        for token, state in [("red",          TrafficLightState.RED),
                               ("yellow",       TrafficLightState.YELLOW),
-                              ("red",          TrafficLightState.RED)]:
+                              ("green",        TrafficLightState.GREEN)]:
             if token in best and best[token][0] >= config.CONF_TRAFFIC_LIGHT:
                 conf, bbox = best[token]
                 log.debug("TL: %s  conf=%.2f  bbox=%s", token, conf, bbox)
@@ -225,41 +224,40 @@ class TrafficLightDetector:
 # ===========================================================================
 class RoadSignDetector:
     """
-    Uses model's own results.names dict — NOT config.SIGN_CLASSES index map.
-    Sign name is normalised to UPPER_CASE_WITH_UNDERSCORES.
+    Fix 2: Uses model ensemble (v1 and v2) from config.
     """
 
     def __init__(self) -> None:
-        self._model    = _load_model(config.MODEL_ROAD_SIGN, "road_sign")
-        self._enabled  = self._model is not None
-        # Fallback: reverse of config map (index → name)
-        self._fallback = {v: k for k, v in config.SIGN_CLASSES.items()}
+        self._models = []
+        m1 = _load_model(config.MODEL_ROAD_SIGN, "road_sign_v1")
+        m2 = _load_model(config.MODEL_ROAD_SIGN_V2, "road_sign_v2")
+        if m1: self._models.append(m1)
+        if m2: self._models.append(m2)
+        
+        self._enabled = len(self._models) > 0
         if self._enabled:
-            log.info("RoadSignDetector: ENABLED")
+            log.info("RoadSignDetector: ENABLED (%d models)", len(self._models))
 
     def infer(self, frame: np.ndarray) -> Optional[SignDetection]:
-        """Run both v1 (best.pt) and v2 (last.pt) — return highest-confidence result."""
         if not self._enabled:
             return None
 
         h, w = frame.shape[:2]
-        # BGR → RGB for YOLO
         rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         resized = cv2.resize(rgb, (config.AI_INFER_W, config.AI_INFER_H))
         sx, sy  = w / config.AI_INFER_W, h / config.AI_INFER_H
 
-        # Collect (conf, sign_name, bbox) from all active models
         candidates: list[tuple[float, str, tuple]] = []
 
         for model in self._models:
             try:
                 results = model(resized, verbose=False,
                                 conf=config.CONF_ROAD_SIGN)[0]
-            except Exception as exc:
-                log.debug("Sign infer error: %s", exc)
+            except Exception:
+                log.warning("Sign ensemble infer error", exc_info=True) # Fix 3
                 continue
 
-            names = results.names   # model's own class dict
+            names = results.names
             boxes = results.boxes
             if boxes is None or len(boxes) == 0:
                 continue
@@ -272,43 +270,39 @@ class RoadSignDetector:
             cls_id   = int(clss[best_i])
             raw_name = str(names.get(cls_id, ""))
             sign_name = _norm_class_name(raw_name) if raw_name else f"SIGN_{cls_id}"
-            bbox      = _scale_bbox(tuple(xyxys[best_i]), sx, sy)  # type: ignore[arg-type]
+            bbox      = _scale_bbox(tuple(xyxys[best_i]), sx, sy)
             candidates.append((float(confs[best_i]), sign_name, bbox))
 
         if not candidates:
             return None
 
-        # Winner = highest confidence across both models
+        # Winner = highest confidence across models
         best_conf, sign_name, bbox = max(candidates, key=lambda t: t[0])
         det = SignDetection(sign_type=sign_name, confidence=best_conf, bbox=bbox)
-        log.debug("Sign (ensemble): %s  conf=%.2f", sign_name, best_conf)
         return det
 
 
 # ===========================================================================
-# DETECTOR 3 — LANE DIVIDER  (advisory — CV is primary)
+# DETECTOR 3 — LANE DIVIDER
 # ===========================================================================
 class LaneDividerDetector:
     def __init__(self) -> None:
         self._model   = _load_model(config.MODEL_LANE_DIVIDER, "lane_divider")
         self._enabled = self._model is not None
-        if self._enabled:
-            log.info("LaneDividerDetector: ENABLED (advisory only)")
 
     def infer(self, frame: np.ndarray) -> Optional[LaneDividerDetection]:
         if not self._enabled:
             return None
 
         h, w    = frame.shape[:2]
-        # CRITICAL FIX: convert BGR → RGB before YOLO inference
         rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         resized = cv2.resize(rgb, (config.AI_INFER_W, config.AI_INFER_H))
 
         try:
             results = self._model(resized, verbose=False,
                                   conf=config.CONF_LANE_DIVIDER)[0]
-        except Exception as exc:
-            log.debug("Divider infer error: %s", exc)
+        except Exception:
+            log.warning("Divider infer error", exc_info=True) # Fix 3
             return None
 
         boxes = results.boxes
@@ -321,7 +315,7 @@ class LaneDividerDetector:
         x1, _, x2, _ = xyxys[best]
         sx       = w / config.AI_INFER_W
         x_centre = float(((x1 + x2) / 2.0) * sx)
-        x_centre = max(0.0, min(x_centre, float(w)))   # clamp to frame
+        x_centre = max(0.0, min(x_centre, float(w)))
 
         return LaneDividerDetection(x_position=x_centre,
                                     divider_type="unknown",
@@ -332,18 +326,11 @@ class LaneDividerDetector:
 # DETECTOR 4 — OBSTACLE
 # ===========================================================================
 class ObstacleDetector:
-    """
-    Minimum bbox area filter: box must cover >= MIN_AREA_FRAC of inference frame.
-    This prevents far-away tiny objects from triggering a detour.
-    """
-
-    MIN_AREA_FRAC = 0.008   # 0.8% of AI_INFER_W * AI_INFER_H
+    MIN_AREA_FRAC = 0.008
 
     def __init__(self) -> None:
         self._model   = _load_model(config.MODEL_OBSTACLE, "obstacle")
         self._enabled = self._model is not None
-        if self._enabled:
-            log.info("ObstacleDetector: ENABLED")
 
     def infer(self, frame: np.ndarray) -> ObstacleDetection:
         _no = ObstacleDetection(present=False, bbox=None,
@@ -352,7 +339,6 @@ class ObstacleDetector:
             return _no
 
         h, w    = frame.shape[:2]
-        # CRITICAL FIX: convert BGR → RGB before YOLO inference
         rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         resized = cv2.resize(rgb, (config.AI_INFER_W, config.AI_INFER_H))
         sx, sy  = w / config.AI_INFER_W, h / config.AI_INFER_H
@@ -360,8 +346,8 @@ class ObstacleDetector:
         try:
             results = self._model(resized, verbose=False,
                                   conf=config.CONF_OBSTACLE)[0]
-        except Exception as exc:
-            log.debug("Obstacle infer error: %s", exc)
+        except Exception:
+            log.warning("Obstacle infer error", exc_info=True) # Fix 3
             return _no
 
         boxes = results.boxes
@@ -377,7 +363,6 @@ class ObstacleDetector:
         if not valid:
             return _no
 
-        # FIX: pick highest-confidence valid detection
         best_conf, best_xyxy = max(valid, key=lambda t: t[0])
         x1, y1, x2, y2 = best_xyxy
         bbox = _scale_bbox((x1, y1, x2, y2), sx, sy)
@@ -388,7 +373,6 @@ class ObstacleDetector:
                     ObstacleSide.RIGHT if x_centre > 2 * third else
                     ObstacleSide.CENTER)
 
-        log.debug("Obstacle: side=%s  conf=%.2f", side.name, best_conf)
         return ObstacleDetection(present=True, bbox=bbox, estimated_side=side)
 
 
@@ -396,25 +380,6 @@ class ObstacleDetector:
 # VISION AI COORDINATOR
 # ===========================================================================
 class VisionAI:
-    """
-    Co-ordinates four detector threads at AI_FPS (not TARGET_FPS).
-
-    Usage::
-        vision = VisionAI()
-        state  = VisionState()
-        vision.start(state)
-
-        # Every control tick:
-        vision.push_frame(frame)
-
-        # Read results:
-        overlays = vision.get_overlays()          # for raw camera window
-        tl_s, tl_b = vision.last_tl_result()
-        fps_d = vision.get_fps_dict()
-
-        vision.stop()
-    """
-
     def __init__(self) -> None:
         self._running      = False
         self._threads: list = []
@@ -433,16 +398,17 @@ class VisionAI:
 
         self._overlay  = AIOverlayState()
 
+        # Heartbeats (Fix 38)
+        self._heartbeats: dict[str, float] = {
+            k: 0.0 for k in ("traffic_light", "sign", "divider", "obstacle")}
+
         self._tl_lock  = threading.Lock()
         self._last_tl: tuple[TrafficLightState, Optional[tuple]] = \
             (TrafficLightState.NONE, None)
 
-    # ------------------------------------------------------------------
     def start(self, shared_state: VisionState) -> None:
         self._shared  = shared_state
         self._running = True
-        _enabled: list[str] = []
-
         specs = [
             ("traffic_light", self._tl_loop,   self._tl_det._enabled),
             ("sign",          self._sign_loop,  self._sign_det._enabled),
@@ -454,13 +420,6 @@ class VisionAI:
                                  name=f"VisionAI-{name}", daemon=True)
             t.start()
             self._threads.append(t)
-            if enabled:
-                _enabled.append(name)
-
-        if _enabled:
-            log.info("VisionAI: active detectors: %s", ", ".join(_enabled))
-        else:
-            log.warning("VisionAI: no detectors active — check models/ and ultralytics install")
         log.info("VisionAI: all detector threads started")
 
     def stop(self) -> None:
@@ -470,9 +429,9 @@ class VisionAI:
         log.info("VisionAI: stopped")
 
     def push_frame(self, frame: np.ndarray) -> None:
-        """Inject latest camera frame. Called every main-loop tick. Thread-safe."""
+        """Inject latest camera frame. Fix 7: Copy frame to avoid mid-processing mutation."""
         with self._frame_lock:
-            self._latest_frame = frame   # only store reference — no copy needed
+            self._latest_frame = frame.copy()
 
     def get_fps(self) -> float:
         vals = [v for v in self._fps_vals.values() if v > 0]
@@ -481,49 +440,53 @@ class VisionAI:
     def get_fps_dict(self) -> dict[str, float]:
         return dict(self._fps_vals)
 
+    def get_heartbeats(self) -> dict[str, float]:
+        """Fix 38: Return last iteration timestamps for watchdog."""
+        return dict(self._heartbeats)
+
     def get_overlays(self) -> list[tuple[str, float, Optional[tuple[int,int,int,int]]]]:
-        """Returns latest AI detections as [(label, conf, bbox)] for raw-window overlay."""
         return self._overlay.get()
 
     def last_tl_result(self) -> tuple[TrafficLightState, Optional[tuple[int,int,int,int]]]:
-        """Returns last (TrafficLightState, bbox). Thread-safe."""
         with self._tl_lock:
             return self._last_tl
 
-    # ------------------------------------------------------------------
-    # INTERNAL HELPERS
-    # ------------------------------------------------------------------
     def _pace(self, name: str, t0: float) -> None:
-        """Sleep remainder of AI_FPS period and update EMA fps counter."""
         period  = 1.0 / config.AI_FPS
         elapsed = time.monotonic() - t0
         time.sleep(max(0.0, period - elapsed))
         total_dt = time.monotonic() - t0
         self._fps_vals[name] = (0.9 * self._fps_vals[name]
                                 + 0.1 / max(total_dt, 1e-6))
+        # Heartbeat (Fix 38)
+        self._heartbeats[name] = time.monotonic()
 
     def _get_frame(self) -> Optional[np.ndarray]:
-        """Thread-safe frame read. Returns None if no frame yet."""
         with self._frame_lock:
             return self._latest_frame
 
     def _rebuild_overlays(self, tl_state: TrafficLightState,
                            tl_bbox: Optional[tuple]) -> None:
-        """Rebuild the unified overlay list from TL + sign state."""
+        """Rebuild the unified overlay list. Fix 8: added obstacles."""
         items: list = []
         if tl_bbox and tl_state != TrafficLightState.NONE:
             items.append((f"TL:{tl_state.name}", 1.0, tl_bbox))
+        
         if self._shared is not None:
             with self._shared.lock:
                 sign = self._shared.sign
+                obs  = self._shared.obstacle
+            
             if sign is not None and sign.bbox is not None:
-                label = sign.sign_type
-                items.append((label, sign.confidence, sign.bbox))
+                items.append((sign.sign_type, sign.confidence, sign.bbox))
+            
+            # Fix 8: Draw obstacle if present
+            if obs is not None and obs.present and obs.bbox is not None:
+                label = f"OBSTACLE:{obs.estimated_side.name}"
+                items.append((label, 1.0, obs.bbox))
+                
         self._overlay.set(items)
 
-    # ------------------------------------------------------------------
-    # DETECTOR LOOPS
-    # ------------------------------------------------------------------
     def _tl_loop(self) -> None:
         while self._running:
             t0    = time.monotonic()
@@ -536,8 +499,8 @@ class VisionAI:
                     with self._tl_lock:
                         self._last_tl = (tl_state, tl_bbox)
                     self._rebuild_overlays(tl_state, tl_bbox)
-                except Exception as exc:
-                    log.debug("VisionAI [traffic_light] error: %s", exc)
+                except Exception:
+                    log.warning("VisionAI [TL] loop error", exc_info=True)
             self._pace("traffic_light", t0)
 
     def _sign_loop(self) -> None:
@@ -549,12 +512,11 @@ class VisionAI:
                     result = self._sign_det.infer(frame)
                     with self._shared.lock:
                         self._shared.sign = result
-                    # Rebuild overlays to include updated sign
                     with self._tl_lock:
                         tl_s, tl_b = self._last_tl
                     self._rebuild_overlays(tl_s, tl_b)
-                except Exception as exc:
-                    log.debug("VisionAI [sign] error: %s", exc)
+                except Exception:
+                    log.warning("VisionAI [Sign] loop error", exc_info=True)
             self._pace("sign", t0)
 
     def _div_loop(self) -> None:
@@ -566,8 +528,8 @@ class VisionAI:
                     result = self._div_det.infer(frame)
                     with self._shared.lock:
                         self._shared.lane_divider = result
-                except Exception as exc:
-                    log.debug("VisionAI [divider] error: %s", exc)
+                except Exception:
+                    log.warning("VisionAI [Divider] loop error", exc_info=True)
             self._pace("divider", t0)
 
     def _obs_loop(self) -> None:
@@ -579,8 +541,8 @@ class VisionAI:
                     result = self._obs_det.infer(frame)
                     with self._shared.lock:
                         self._shared.obstacle = result
-                except Exception as exc:
-                    log.debug("VisionAI [obstacle] error: %s", exc)
+                except Exception:
+                    log.warning("VisionAI [Obstacle] loop error", exc_info=True)
             self._pace("obstacle", t0)
 
 
@@ -591,11 +553,7 @@ if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)
 
-    print()
-    print(f"Models found in {config.MODELS_DIR}:")
-    for f in sorted(config.MODELS_DIR.glob("*.pt")):
-        print(f"  {f.name}  ({f.stat().st_size/1e6:.1f} MB)")
-    print()
+    print(f"\nSign Model paths:\n v1: {config.MODEL_ROAD_SIGN}\n v2: {config.MODEL_ROAD_SIGN_V2}\n")
 
     vs     = VisionState()
     vision = VisionAI()
@@ -608,8 +566,7 @@ if __name__ == "__main__":
         print(f"Obstacle      : {vs.obstacle}")
 
     print(f"FPS dict      : {vision.get_fps_dict()}")
+    print(f"Heartbeats    : {vision.get_heartbeats()}")
     print(f"Overlays      : {vision.get_overlays()}")
-    tl_s, tl_b = vision.last_tl_result()
-    print(f"Last TL       : state={tl_s}  bbox={tl_b}")
     vision.stop()
     print("vision_ai smoke-test DONE")

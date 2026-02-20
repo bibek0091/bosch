@@ -227,15 +227,22 @@ class BFMCPilot:
                 behavior_cmd = self.behavior.update(self.vision_st, nav_state)
 
                 # ── 6. Obstacle handler → extra lane offset ──────────────
-                obs_offset = self.obs_hdlr.compute_offset(
-                    self.vision_st.obstacle,   # read without lock (atomic read on CPython)
+                # Fix 21, 19: handler now returns potential stop command
+                obs_offset, obs_cmd = self.obs_hdlr.compute_offset(
+                    self.vision_st.obstacle,
                     self.lane_width_px,
                 )
 
-                # Total offset: behavior override takes priority over obstacle
-                if (behavior_cmd.lane_offset_override is not None
-                        and behavior_cmd.mode == BehaviorMode.DETOUR):
-                    total_offset = behavior_cmd.lane_offset_override
+                # Total behavior: prioritize specific obstacle stop cmd
+                active_cmd = behavior_cmd
+                if obs_cmd is not None:
+                    active_cmd = obs_cmd
+
+                # Total offset: behavior detour takes priority (Fix 19 guard)
+                if (active_cmd.lane_offset_override is not None
+                        and active_cmd.mode == BehaviorMode.DETOUR):
+                    # Only detour if we aren't already stopped by something else
+                    total_offset = active_cmd.lane_offset_override
                 else:
                     total_offset = obs_offset
 
@@ -244,7 +251,7 @@ class BFMCPilot:
                 eff_la    = self._compute_lookahead(nav_state, curvature)
 
                 # ── 8. Target x ──────────────────────────────────────────
-                y_eval = max(0, self.tracker.h - eff_la)    # FIX: use eff_la not hardcoded 40
+                y_eval = max(0, self.tracker.h - eff_la)
                 raw_target_x, anchor = self.tracker.get_target_x(
                     y_eval, self.lane_width_px, total_offset, nav_state
                 )
@@ -260,7 +267,8 @@ class BFMCPilot:
                     target_x         = raw_target_x
 
                 # ── 10. Steering computation ─────────────────────────────
-                steer_angle = self.ctrl.compute_steer(target_x, eff_la, self.lane_width_px)
+                # Fix 16: pass nav_state for roundabout lookahead scaling
+                steer_angle = self.ctrl.compute_steer(target_x, eff_la, self.lane_width_px, nav_state)
 
                 # Guard (divider safety)
                 steer_angle, guard_spd, guard_on = self.ctrl.apply_guard(
@@ -275,34 +283,39 @@ class BFMCPilot:
                     steer_angle  = steer_angle,
                     curvature    = curvature,
                     lost_frames  = self.lost_frames,
-                    behavior_cmd = behavior_cmd,
+                    behavior_cmd = active_cmd,
                     guard_on     = guard_on,
                     guard_spd    = guard_spd,
                 )
 
-                # ── 12. Actuation ────────────────────────────────────────
+                # ── 12. Actuation (Fix 32: Reset on stop) ────────────────
+                if speed == 0:
+                    self.ctrl.reset()
                 self._actuate(speed, steer_angle)
 
-                # ── 13. Honk ────────────────────────────────────────────
+                # ── 13. System Watchdog (Fix 40) ─────────────────────────
+                self._check_watchdog()
+
+                # ── 14. Honk ────────────────────────────────────────────
                 if self.behavior.honk_active and self.connected:
                     try:
                         self.handler.set_speed(0)   # stop briefly before honk
                     except Exception:
                         pass
 
-                # ── 14. EMA FPS ──────────────────────────────────────────
+                # ── 15. EMA FPS ──────────────────────────────────────────
                 elapsed    = time.time() - t_frame
                 inst_fps   = 1.0 / max(elapsed, 1e-6)
                 self._fps  = 0.9 * self._fps + 0.1 * inst_fps
 
-                # ── 15. Raw camera window with AI detection overlays ──────
+                # ── 16. Raw camera window with AI detection overlays ──────
                 self._show_raw(frame)
 
-                # ── 16. BEV debug window ─────────────────────────────────
+                # ── 17. BEV debug window ─────────────────────────────────
                 self._show_debug(dbg, steer_angle, speed, anchor, nav_state,
                                  detect_mode, guard_on, curvature)
 
-                # ── 17. Dashboard: imshow from MAIN THREAD ───────────────
+                # ── 18. Dashboard Update ───────
                 self._update_dashboard(
                     frame, warped_colour, dbg, steer_angle, speed, anchor,
                     nav_state, curvature, guard_on, detect_mode,
@@ -310,7 +323,7 @@ class BFMCPilot:
                 if self.dash is not None:
                     cv2.imshow("BFMC Dashboard", self.dash.get_canvas())
 
-                # ── 17. Frame-rate cap ────────────────────────────────────
+                # ── 19. Frame-rate cap ────────────────────────────────────
                 elapsed = time.time() - t_frame
                 wait_ms = max(1, int((config.FRAME_PERIOD - elapsed) * 1000))
                 key = cv2.waitKey(wait_ms) & 0xFF
@@ -325,6 +338,23 @@ class BFMCPilot:
     # -----------------------------------------------------------------------
     # PRIVATE HELPERS
     # -----------------------------------------------------------------------
+
+    def _check_watchdog(self) -> None:
+        """Fix 40: Check component heartbeats and log warnings if stalled."""
+        now     = time.monotonic()
+        timeout = getattr(config, "WATCHDOG_TIMEOUT_S", 2.0)
+
+        # 1. Camera
+        cam_dt = now - self.camera.heartbeat
+        if cam_dt > timeout:
+            log.warning("WATCHDOG: CameraManager stalled (%.1fs pulse)", cam_dt)
+
+        # 2. VisionAI (ensemble check)
+        v_beats = self.vision.get_heartbeats()
+        for name, heartbeat in v_beats.items():
+            v_dt = now - heartbeat
+            if v_dt > timeout:
+                log.warning("WATCHDOG: VisionAI [%s] stalled (%.1fs pulse)", name, v_dt)
 
     def _actuate(self, speed: float, steer: float) -> None:
         s_clamped = float(max(-config.MAX_STEER, min(config.MAX_STEER, steer)))
