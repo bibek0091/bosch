@@ -197,36 +197,55 @@ class SpeedPolicy:
 
     def compute_speed(
         self,
-        base_speed:      float,
-        nav_state:       str,
-        anchor:          str,
-        steer_angle:     float,
-        curvature:       float,
-        lost_frames:     int,
-        behavior_cmd:    Optional["BehaviorCommand"] = None,
-        guard_on:        bool  = False,
-        guard_spd:       float = 1.0,
+        base_speed:   float,
+        nav_state:    str,
+        anchor:       str,
+        steer_angle:  float,
+        curvature:    float,
+        lost_frames:  int,
+        behavior_cmd: BehaviorCommand,
+        guard_on:     bool = False,
+        guard_spd:    float = 0.0,
+        lost_start_time: float = 0.0,
     ) -> float:
         """
-        Returns the final speed value (0–200).
+        Speed selection based on road features, steering load, and behavior commands.
+        lost_start_time: Fix 37, timestamp when lane was first lost.
         """
-        # --- Behavior overrides ---
-        if behavior_cmd is not None:
-            if behavior_cmd.mode == BehaviorMode.FULL_STOP:
+        now = time.monotonic()
+        
+        # 1. Behavior override (Priority) - behavior_cmd is already scaled in BehaviorEngine
+        if behavior_cmd.mode == BehaviorMode.FULL_STOP:
+            # Fix 32: Reset on stop
+            # SpeedPolicy does not have a reset method, this might be a placeholder or intended for a different class.
+            # For now, we'll just return 0.0 as per the original logic.
+            # self.reset() 
+            return 0.0
+        
+        effective_base = base_speed * behavior_cmd.speed_multiplier
+        
+        # Fix 14: Highway max speed enforcement
+        if behavior_cmd.mode == BehaviorMode.HIGHWAY:
+            h_max = getattr(config, "HIGHWAY_MAX_SPEED", 120.0)
+            effective_base = min(effective_base, h_max)
+
+        # 2. Lost-lane policy (Fix 37: real-time)
+        is_lost = (anchor == "LOST" or lost_frames > 0)
+        lost_dt = (now - lost_start_time) if (lost_start_time > 0) else 0.0
+
+        if is_lost:
+            if config.LOST_STOP and lost_dt > config.LOST_GRACE_SECONDS:
                 return 0.0
             
-            effective_base = base_speed * behavior_cmd.speed_multiplier
+            # Creep speed during grace or if LOST_STOP is False
+            creep_spd = config.LOST_CREEP_SPEED
             
-            # Fix 14: Highway max speed enforcement
-            if behavior_cmd.mode == BehaviorMode.HIGHWAY:
-                h_max = getattr(config, "HIGHWAY_MAX_SPEED", 120.0)
-                effective_base = min(effective_base, h_max)
-        else:
-            effective_base = base_speed
-
-        # --- Lost-lane hard stop ---
-        if config.LOST_STOP and lost_frames > config.LOST_GRACE_FRAMES:
-            return 0.0
+            # Decelerate into creep
+            if 0 < lost_dt <= config.LOST_GRACE_SECONDS:
+                frac  = min(lost_dt / max(config.LOST_GRACE_SECONDS, 0.01), 1.0)
+                speed = effective_base * (1.0 - frac) + creep_spd * frac
+                return speed
+            return creep_spd
 
         # --- Base = 0 or Below Stall Threshold (Fix 15) ---
         stall_limit = getattr(config, "MOTOR_STALL_THRESHOLD", 30.0)
@@ -252,11 +271,6 @@ class SpeedPolicy:
             speed = effective_base * config.MED_STEER_SCALE
         else:
             speed = effective_base
-
-        # --- Lost-lane creep / slow-down ---
-        if 0 < lost_frames <= config.LOST_GRACE_FRAMES:
-            frac  = min(lost_frames / max(config.LOST_GRACE_FRAMES, 1), 1.0)
-            speed = max(config.LOST_CREEP_SPEED, speed * (1.0 - frac * 0.70))
 
         # --- Guard speed penalty ---
         if guard_on:
@@ -346,13 +360,15 @@ class SteeringController:
         steer_angle:  float,
         curvature:    float,
         lost_frames:  int,
-        behavior_cmd: Optional["BehaviorCommand"] = None,
-        guard_on:     bool  = False,
-        guard_spd:    float = 1.0,
+        behavior_cmd: BehaviorCommand,
+        guard_on:     bool = False,
+        guard_spd:    float = 0.0,
+        lost_start_time: float = 0.0,
     ) -> float:
         return self._policy.compute_speed(
             base_speed, nav_state, anchor, steer_angle,
             curvature, lost_frames, behavior_cmd, guard_on, guard_spd,
+            lost_start_time
         )
 
     def reset(self) -> None:
@@ -380,14 +396,14 @@ if __name__ == "__main__":
     assert s_right > 0, f"Expected positive steer, got {s_right}"
 
     # Speed at 0 base → 0
-    spd = ctrl.compute_speed(0, "NORMAL", "DUAL", 0.0, 0.0, 0)
+    from behavior_engine import BehaviorCommand, BehaviorMode
+    cmd_normal = BehaviorCommand(mode=BehaviorMode.NORMAL, speed_multiplier=1.0)
+    spd = ctrl.compute_speed(0, "NORMAL", "DUAL", 0.0, 0.0, 0, cmd_normal)
     assert spd == 0.0
 
     # Speed FULL_STOP behavior
-    from behavior_engine import BehaviorCommand, BehaviorMode
-    cmd  = BehaviorCommand(mode=BehaviorMode.FULL_STOP, speed_multiplier=0.0,
-                           lane_offset_override=None, hold_frames=0)
-    spd  = ctrl.compute_speed(50, "NORMAL", "DUAL", 0.0, 0.0, 0, cmd)
+    cmd_stop = BehaviorCommand(mode=BehaviorMode.FULL_STOP, speed_multiplier=0.0)
+    spd = ctrl.compute_speed(50, "NORMAL", "DUAL", 0.0, 0.0, 0, cmd_stop)
     assert spd == 0.0
 
     print("steering_controller smoke-test PASSED")

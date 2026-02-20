@@ -328,18 +328,19 @@ class JunctionDetector:
            left_fit, right_fit, lane_width_px) -> state_str
     """
 
-    ENTRY_FRAMES       = config.JCT_ENTRY_FRAMES
-    EXIT_FRAMES        = config.JCT_EXIT_FRAMES
+    ENTRY_SECONDS      = config.JCT_ENTRY_SECONDS
+    EXIT_SECONDS       = config.JCT_EXIT_SECONDS
     CROSS_ENERGY_RATIO = config.JCT_CROSS_ENERGY_RATIO
     WIDTH_RATIO_HIGH   = config.JCT_WIDTH_RATIO_HIGH
     MIN_BOT_ENERGY     = config.JCT_MIN_BOT_ENERGY
-    MAX_JCT_FRAMES     = config.JCT_MAX_FRAMES
+    MAX_JCT_SECONDS    = config.JCT_MAX_SECONDS
 
     def __init__(self) -> None:
         self.state         = "NORMAL"
-        self.entry_count   = 0
-        self.exit_count    = 0
-        self.frames_in_jct = 0
+        self._entry_start  = 0.0
+        self._exit_start   = 0.0
+        self._jct_start    = 0.0
+        self.heartbeat     = time.monotonic()
 
     def update(
         self,
@@ -370,23 +371,38 @@ class JunctionDetector:
 
         evidence = both_lost or cross_energy or wide_lane
 
+        now = time.monotonic()
+        self.heartbeat = now
+
+        evidence = both_lost or cross_energy or wide_lane
+
         if self.state == "NORMAL":
-            self.entry_count = self.entry_count + 1 if evidence else 0
-            if self.entry_count >= self.ENTRY_FRAMES:
-                self.state         = "JUNCTION"
-                self.exit_count    = 0
-                self.frames_in_jct = 0
-                log.info("Junction ENTERED")
+            if evidence:
+                if self._entry_start == 0:
+                    self._entry_start = now
+                elif now - self._entry_start >= self.ENTRY_SECONDS:
+                    self.state      = "JUNCTION"
+                    self._exit_start = 0.0
+                    self._jct_start  = now
+                    log.info("Junction ENTERED")
+            else:
+                self._entry_start = 0.0
 
         elif self.state == "JUNCTION":
-            self.frames_in_jct += 1
-            self.exit_count = self.exit_count + 1 if not evidence else 0
-            normal_exit  = (self.exit_count >= self.EXIT_FRAMES and self.frames_in_jct > 15)
-            timeout_exit = self.frames_in_jct > self.MAX_JCT_FRAMES
+            if not evidence:
+                if self._exit_start == 0:
+                    self._exit_start = now
+            else:
+                self._exit_start = 0.0
+
+            # Exit if clear for long enough OR timeout
+            normal_exit  = (self._exit_start > 0 and (now - self._exit_start >= self.EXIT_SECONDS))
+            timeout_exit = (now - self._jct_start >= self.MAX_JCT_SECONDS)
+
             if normal_exit or timeout_exit:
                 reason = "timeout" if timeout_exit else "clear"
-                self.state       = "NORMAL"
-                self.entry_count = 0
+                self.state        = "NORMAL"
+                self._entry_start = 0.0
                 log.info("Junction EXITED (%s)", reason)
 
         return self.state
@@ -404,18 +420,19 @@ class RoundaboutNavigator:
     update(left_fit, right_fit, lane_width_px, img_h) -> state_str
     """
 
-    ENTRY_WIDTH_RATIO = config.RBT_ENTRY_WIDTH_RATIO
-    ENTRY_FRAMES      = config.RBT_ENTRY_FRAMES       # debounce before entering
-    EXIT_WIDTH_RATIO  = config.RBT_EXIT_WIDTH_RATIO
-    MIN_CIRCLE_FRAMES = config.RBT_MIN_CIRCLE_FRAMES
-    MAX_CIRCLE_FRAMES = config.RBT_MAX_CIRCLE_FRAMES
-    SPEED_SCALE       = config.RBT_SPEED_SCALE
-    LOOKAHEAD_SCALE   = config.RBT_LOOKAHEAD_SCALE
+    ENTRY_WIDTH_RATIO     = config.RBT_ENTRY_WIDTH_RATIO
+    ENTRY_SECONDS         = config.RBT_ENTRY_SECONDS
+    EXIT_WIDTH_RATIO      = config.RBT_EXIT_WIDTH_RATIO
+    MIN_CIRCLE_SECONDS    = config.RBT_MIN_CIRCLE_SECONDS
+    MAX_CIRCLE_SECONDS    = config.RBT_MAX_CIRCLE_SECONDS
+    SPEED_SCALE           = config.RBT_SPEED_SCALE
+    LOOKAHEAD_SCALE       = config.RBT_LOOKAHEAD_SCALE
 
     def __init__(self) -> None:
-        self.state       = "NORMAL"
-        self.frames      = 0
-        self.entry_count = 0   # consecutive frames with narrow ratio
+        self.state        = "NORMAL"
+        self._rbt_start   = 0.0
+        self._entry_start = 0.0
+        self.heartbeat    = time.monotonic()
 
     def update(
         self,
@@ -424,6 +441,8 @@ class RoundaboutNavigator:
         lane_width_px: int,
         img_h: int = config.BEV_H,
     ) -> str:
+        now = time.monotonic()
+        self.heartbeat = now
         y = img_h - 50
 
         if left_fit is not None and right_fit is not None:
@@ -433,33 +452,33 @@ class RoundaboutNavigator:
 
             if self.state == "NORMAL":
                 if ratio < self.ENTRY_WIDTH_RATIO:
-                    self.entry_count += 1
-                    if self.entry_count >= self.ENTRY_FRAMES:
+                    if self._entry_start == 0:
+                        self._entry_start = now
+                    elif now - self._entry_start >= self.ENTRY_SECONDS:
                         self.state       = "ROUNDABOUT"
-                        self.frames      = 0
-                        self.entry_count = 0
+                        self._rbt_start   = now
+                        self._entry_start = 0.0
                         log.info("Roundabout ENTRY detected")
                 else:
-                    self.entry_count = 0   # reset on non-narrow frame
+                    self._entry_start = 0.0
 
             elif self.state == "ROUNDABOUT":
-                self.frames += 1
-                normal_exit  = (self.frames > self.MIN_CIRCLE_FRAMES and
+                # Exit if wide enough after min time OR timeout
+                normal_exit  = (now - self._rbt_start > self.MIN_CIRCLE_SECONDS and
                                 ratio > self.EXIT_WIDTH_RATIO)
-                timeout_exit = self.frames > self.MAX_CIRCLE_FRAMES
+                timeout_exit = (now - self._rbt_start > self.MAX_CIRCLE_SECONDS)
                 if normal_exit or timeout_exit:
                     reason = "timeout" if timeout_exit else "width ratio"
-                    self.state  = "NORMAL"
-                    self.frames = 0
+                    self.state      = "NORMAL"
+                    self._rbt_start = 0.0
                     log.info("Roundabout EXIT (%s)", reason)
 
         elif self.state == "ROUNDABOUT":
-            # One line lost inside roundabout — count frames, timeout exit
-            self.frames += 1
-            if self.frames > self.MAX_CIRCLE_FRAMES:
-                self.state  = "NORMAL"
-                self.frames = 0
-                log.info("Roundabout EXIT (timeout, one line lost)")
+            # Lines lost inside roundabout — count time, timeout exit
+            if now - self._rbt_start > self.MAX_CIRCLE_SECONDS:
+                self.state      = "NORMAL"
+                self._rbt_start = 0.0
+                log.info("Roundabout EXIT (timeout, lines lost)")
 
         return self.state
 

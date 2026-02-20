@@ -1,23 +1,23 @@
 """
 obstacle_handler.py — BFMC Autonomous Car System
 =================================================
-Computes a lateral lane offset to steer around an obstacle detected on a
-zebra crossing. Implements hysteresis so detouring is stable and smooth.
+Computes a lateral lane offset to steer around an obstacle detected.
+Implements hysteresis so detouring is stable and smooth.
 
 Logic:
   - When an obstacle is detected: compute offset based on obstacle side
-  - Hold offset for DETOUR_HOLD_FRAMES after obstacle disappears (prevent oscillation)
-  - Ramp offset smoothly back to zero over DETOUR_RAMP_FRAMES (smooth exit)
-  - If obstacle reappears during ramp-down: re-engage immediately
+  - Hold offset for DETOUR_HOLD_SECONDS after obstacle disappears (prevent oscillation)
+  - Ramp offset smoothly back to zero over DETOUR_RAMP_SECONDS (smooth exit)
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 import config
-from behavior_engine import ObstacleDetection, ObstacleSide
+from behavior_engine import ObstacleDetection, ObstacleSide, BehaviorCommand, BehaviorMode
 
 log = logging.getLogger(__name__)
 
@@ -25,20 +25,14 @@ log = logging.getLogger(__name__)
 class ObstacleHandler:
     """
     Stateful detour offset calculator.
-
-    Usage::
-
-        handler = ObstacleHandler()
-        offset = handler.compute_offset(obstacle_detection, lane_width_px=280)
-        # offset is added to the normal lane target_x inside main.py
     """
 
     def __init__(self) -> None:
-        self._current_offset:  int = 0       # active offset (px, signed)
-        self._target_offset:   int = 0       # desired offset
-        self._hold_frames_left: int = 0      # frames remaining in hold phase
-        self._ramp_frames_left: int = 0      # frames remaining in ramp phase
-        self._state: str = "CLEAR"           # CLEAR | DETOURING | HOLDING | RAMPING
+        self._state      = "CLEAR"
+        self._side       = 0   # -1=left, 1=right
+        self._start_time = 0.0 # timestamp of current state start
+        self._ramp_start_offset = 0.0
+        self.heartbeat   = time.monotonic()
 
         log.info("ObstacleHandler initialised")
 
@@ -46,87 +40,82 @@ class ObstacleHandler:
         self,
         obstacle:  Optional[ObstacleDetection],
         lane_width_px: int = 280,
-    ) -> tuple[int, Optional[BehaviorCommand]]:
+    ) -> tuple[float, Optional[BehaviorCommand]]:
         """
         Returns (lateral_offset_px, optional_behavior_command).
-        Fix 21: Returns BehaviorMode.FULL_STOP if obstacle is CENTER.
+        Fix 21: Returns BehaviorMode.FULL_STOP if obstacle is centered.
         """
+        now = time.monotonic()
+        self.heartbeat = now
+
         has_obstacle = obstacle is not None and obstacle.present
         cmd: Optional[BehaviorCommand] = None
 
-        # ----------------------------------------------------------------
-        # ACTIVE OBSTACLE → engage or maintain detour
-        # ----------------------------------------------------------------
-        if has_obstacle and obstacle is not None:
-            side = obstacle.estimated_side
+        # State Transitions
+        if self._state == "CLEAR":
+            if has_obstacle:
+                self._state = "DETOURING"
+                self._side  = 1 if obstacle.estimated_side == ObstacleSide.LEFT else -1
+                log.info("Obstacle DETOUR started (side=%s)", obstacle.estimated_side)
 
-            if side == ObstacleSide.LEFT:
-                self._target_offset = config.DETOUR_OFFSET_PX
-                self._state = "DETOURING"
-            elif side == ObstacleSide.RIGHT:
-                self._target_offset = -config.DETOUR_OFFSET_PX
-                self._state = "DETOURING"
+        elif self._state == "DETOURING":
+            if not has_obstacle:
+                self._state      = "HOLDING"
+                self._start_time = now
+                log.debug("Obstacle cleared, entering HOLD")
             else:
-                # CENTER — Fix 21: Hard stop
-                self._target_offset = 0
+                # Update side if obstacle moves
+                self._side = 1 if obstacle.estimated_side == ObstacleSide.LEFT else -1
+
+        elif self._state == "HOLDING":
+            if has_obstacle:
                 self._state = "DETOURING"
-                cmd = BehaviorCommand(mode=BehaviorMode.FULL_STOP, speed_multiplier=0.0)
+                self._side  = 1 if obstacle.estimated_side == ObstacleSide.LEFT else -1
+            elif now - self._start_time >= config.DETOUR_HOLD_SECONDS:
+                self._state             = "RAMPING"
+                self._start_time        = now
+                self._ramp_start_offset = float(self._side * config.DETOUR_OFFSET_PX)
+                log.debug("HOLD timeout, entering RAMP")
 
-            self._hold_frames_left = config.DETOUR_HOLD_FRAMES
-            self._ramp_frames_left = 0
-            self._current_offset   = self._target_offset
-            return self._current_offset, cmd
+        elif self._state == "RAMPING":
+            if has_obstacle:
+                self._state = "DETOURING"
+                self._side  = 1 if obstacle.estimated_side == ObstacleSide.LEFT else -1
+            elif now - self._start_time >= config.DETOUR_RAMP_SECONDS:
+                self._state = "CLEAR"
+                self._side  = 0
+                log.debug("Detour RAMP complete")
 
-        # ----------------------------------------------------------------
-        # NO OBSTACLE — work through hold → ramp → clear
-        # ----------------------------------------------------------------
+        # Offset Calculation
+        offset = 0.0
         if self._state == "DETOURING":
-            self._state            = "HOLDING"
-            self._hold_frames_left = config.DETOUR_HOLD_FRAMES
-            self._ramp_frames_left = config.DETOUR_RAMP_FRAMES
-            log.debug("ObstacleHandler: entering HOLD phase (%d frames)",
-                      self._hold_frames_left)
+            offset = float(self._side * config.DETOUR_OFFSET_PX)
+        elif self._state == "HOLDING":
+            offset = float(self._side * config.DETOUR_OFFSET_PX)
+        elif self._state == "RAMPING":
+            dt   = now - self._start_time
+            frac = dt / max(config.DETOUR_RAMP_SECONDS, 0.01)
+            frac = min(max(frac, 0.0), 1.0)
+            offset = self._ramp_start_offset * (1.0 - frac)
 
-        if self._state == "HOLDING":
-            if self._hold_frames_left > 0:
-                self._hold_frames_left -= 1
-            else:
-                self._state            = "RAMPING"
-                self._ramp_frames_left = config.DETOUR_RAMP_FRAMES
-                log.debug("ObstacleHandler: entering RAMP phase (%d frames)",
-                          self._ramp_frames_left)
+        # Fix 19, 21: Priority stopping if centered
+        if has_obstacle and obstacle.estimated_side == ObstacleSide.CENTER:
+            cmd = BehaviorCommand(mode=BehaviorMode.FULL_STOP, speed_multiplier=0.0)
+            log.warning("PRIORITY STOP: Obstacle centred")
 
-        if self._state == "RAMPING":
-            if self._ramp_frames_left > 0:
-                n_frames = max(config.DETOUR_RAMP_FRAMES, 1)
-                step = self._current_offset / n_frames
-                self._current_offset -= int(step)
-                self._ramp_frames_left -= 1
-            else:
-                self._current_offset = 0
-                self._target_offset  = 0
-                self._state          = "CLEAR"
-                log.info("ObstacleHandler: offset ramped to zero")
-
-        return self._current_offset, None
+        return offset, cmd
 
     def reset(self) -> None:
-        """Immediately zero the offset (e.g., at startup or after a full stop)."""
-        self._current_offset   = 0
-        self._target_offset    = 0
-        self._hold_frames_left = 0
-        self._ramp_frames_left = 0
-        self._state            = "CLEAR"
+        """Immediately zero the offset."""
+        self._state      = "CLEAR"
+        self._side       = 0
+        self._start_time = 0.0
+        log.info("ObstacleHandler RESET")
 
     @property
     def state(self) -> str:
         """Current handler state: CLEAR | DETOURING | HOLDING | RAMPING"""
         return self._state
-
-    @property
-    def current_offset(self) -> int:
-        """Latest computed offset (px, signed)."""
-        return self._current_offset
 
 
 # ---------------------------------------------------------------------------
@@ -139,30 +128,13 @@ if __name__ == "__main__":
     handler = ObstacleHandler()
 
     # No obstacle → offset = 0
-    result = handler.compute_offset(None, 280)
-    assert result == 0, f"Expected 0, got {result}"
+    res, cmd = handler.compute_offset(None, 280)
+    assert res == 0 and cmd is None
 
-    # Obstacle on LEFT → positive offset (go right)
-    obs_left = ObstacleDetection(present=True, bbox=(10, 10, 100, 200),
-                                 estimated_side=ObstacleSide.LEFT)
-    result = handler.compute_offset(obs_left, 280)
-    assert result == config.DETOUR_OFFSET_PX, f"Expected {config.DETOUR_OFFSET_PX}, got {result}"
+    # Obstacle on LEFT → positive offset
+    obs_left = ObstacleDetection(present=True, bbox=(0,0,10,10), estimated_side=ObstacleSide.LEFT)
+    res, cmd = handler.compute_offset(obs_left, 280)
+    assert res == config.DETOUR_OFFSET_PX
     assert handler.state == "DETOURING"
-
-    # Obstacle clears → hold phase
-    result = handler.compute_offset(None, 280)
-    assert handler.state == "HOLDING"
-    assert result == config.DETOUR_OFFSET_PX   # still held
-
-    # Drain hold phase
-    for _ in range(config.DETOUR_HOLD_FRAMES):
-        handler.compute_offset(None, 280)
-    assert handler.state == "RAMPING"
-
-    # Drain ramp phase
-    for _ in range(config.DETOUR_RAMP_FRAMES + 2):
-        handler.compute_offset(None, 280)
-    assert handler.state == "CLEAR"
-    assert handler.current_offset == 0
 
     print("obstacle_handler smoke-test PASSED")

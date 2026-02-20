@@ -112,6 +112,7 @@ class BFMCPilot:
         self.prev_steer:    float = 0.0
         self.last_target:   Optional[float] = None
         self.lost_frames:   int   = 0
+        self.lost_start_time: float = 0.0
 
         # EMA FPS tracker
         self._fps: float = 0.0
@@ -259,10 +260,13 @@ class BFMCPilot:
                 # ── 9. Lost-lane handling (grace period) ─────────────────
                 lost = raw_target_x is None
                 if lost:
+                    if self.lost_frames == 0:
+                        self.lost_start_time = time.monotonic()
                     self.lost_frames += 1
                     target_x = self.last_target if self.last_target is not None else float(config.BEV_W // 2)
                 else:
                     self.lost_frames = 0
+                    self.lost_start_time = 0.0
                     self.last_target = raw_target_x
                     target_x         = raw_target_x
 
@@ -277,15 +281,16 @@ class BFMCPilot:
 
                 # ── 11. Speed policy ─────────────────────────────────────
                 speed = self.ctrl.compute_speed(
-                    base_speed   = self.base_speed,
-                    nav_state    = nav_state,
-                    anchor       = anchor,
-                    steer_angle  = steer_angle,
-                    curvature    = curvature,
-                    lost_frames  = self.lost_frames,
-                    behavior_cmd = active_cmd,
-                    guard_on     = guard_on,
-                    guard_spd    = guard_spd,
+                    base_speed      = self.base_speed,
+                    nav_state       = nav_state,
+                    anchor          = anchor,
+                    steer_angle     = steer_angle,
+                    curvature       = curvature,
+                    lost_frames     = self.lost_frames,
+                    behavior_cmd    = active_cmd,
+                    guard_on        = guard_on,
+                    guard_spd       = guard_spd,
+                    lost_start_time = self.lost_start_time,
                 )
 
                 # ── 12. Actuation (Fix 32: Reset on stop) ────────────────
