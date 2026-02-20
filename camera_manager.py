@@ -2,13 +2,18 @@
 camera_manager.py — BFMC Autonomous Car System
 ===============================================
 Producer-consumer camera abstraction. One Picamera2 instance distributes
-raw RGB frames to two independent consumers:
+raw BGR frames to two independent consumers:
 
   Consumer 1 — image_processing.py  : BEV warp + lane detection pipeline
   Consumer 2 — vision_ai.py         : AI inference (natural perspective)
 
 The frame is captured ONCE per tick and shared via a thread-safe buffer.
 Both consumers call get_frame() and receive the same numpy array reference.
+
+IMPORTANT: Picamera2 capture_array() ALWAYS returns RGB regardless of the
+BGR888 format setting in create_video_configuration (that setting only
+affects the DMA hardware buffer layout, not the numpy output). We convert
+RGB→BGR once here so all downstream code (BEV, YOLO, dashboard) gets BGR.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import threading
 import time
 from typing import Optional
 
+import cv2
 import numpy as np
 
 import config
@@ -153,12 +159,15 @@ class CameraManager:
 
             if self._cam_ok:
                 try:
-                    raw = self._picam2.capture_array()   # BGR numpy array
-                    # FIX: np.array() creates an owned copy so Picamera2 can
-                    # safely recycle its DMA buffer without corrupting our frame.
-                    owned = np.array(raw, copy=True)
+                    raw = self._picam2.capture_array()
+                    # CRITICAL: Picamera2 always returns RGB (even with BGR888 config).
+                    # Convert to BGR once here so ALL downstream code is correct:
+                    #   - BEV processor : expects BGR for cv2 colour ops
+                    #   - YOLO detectors: we then do BGR→RGB before inference
+                    #   - Dashboard     : imshow expects BGR
+                    bgr = cv2.cvtColor(np.array(raw, copy=True), cv2.COLOR_RGB2BGR)
                     with self._lock:
-                        self._frame = owned
+                        self._frame = bgr
                         self._frame_count += 1
                 except Exception as exc:
                     log.warning("CameraManager: capture error: %s", exc)

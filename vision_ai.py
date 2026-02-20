@@ -238,43 +238,50 @@ class RoadSignDetector:
             log.info("RoadSignDetector: ENABLED")
 
     def infer(self, frame: np.ndarray) -> Optional[SignDetection]:
+        """Run both v1 (best.pt) and v2 (last.pt) — return highest-confidence result."""
         if not self._enabled:
             return None
 
         h, w = frame.shape[:2]
-        # CRITICAL FIX: YOLO expects RGB, OpenCV gives BGR. Red TL = blue without this!
+        # BGR → RGB for YOLO
         rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         resized = cv2.resize(rgb, (config.AI_INFER_W, config.AI_INFER_H))
         sx, sy  = w / config.AI_INFER_W, h / config.AI_INFER_H
 
-        try:
-            results = self._model(resized, verbose=False,
-                                  conf=config.CONF_ROAD_SIGN)[0]
-        except Exception as exc:
-            log.debug("Sign infer error: %s", exc)
+        # Collect (conf, sign_name, bbox) from all active models
+        candidates: list[tuple[float, str, tuple]] = []
+
+        for model in self._models:
+            try:
+                results = model(resized, verbose=False,
+                                conf=config.CONF_ROAD_SIGN)[0]
+            except Exception as exc:
+                log.debug("Sign infer error: %s", exc)
+                continue
+
+            names = results.names   # model's own class dict
+            boxes = results.boxes
+            if boxes is None or len(boxes) == 0:
+                continue
+
+            confs = boxes.conf.cpu().numpy()
+            clss  = boxes.cls.cpu().numpy().astype(int)
+            xyxys = boxes.xyxy.cpu().numpy()
+
+            best_i   = int(confs.argmax())
+            cls_id   = int(clss[best_i])
+            raw_name = str(names.get(cls_id, ""))
+            sign_name = _norm_class_name(raw_name) if raw_name else f"SIGN_{cls_id}"
+            bbox      = _scale_bbox(tuple(xyxys[best_i]), sx, sy)  # type: ignore[arg-type]
+            candidates.append((float(confs[best_i]), sign_name, bbox))
+
+        if not candidates:
             return None
 
-        names = results.names      # MODEL's own dict — correct!
-        boxes = results.boxes
-        if boxes is None or len(boxes) == 0:
-            return None
-
-        confs  = boxes.conf.cpu().numpy()
-        clss   = boxes.cls.cpu().numpy().astype(int)
-        xyxys  = boxes.xyxy.cpu().numpy()
-
-        best_i    = int(confs.argmax())
-        cls_id    = int(clss[best_i])
-        raw_name  = str(names.get(cls_id, ""))
-        # Use model name first; fall back to config index map
-        sign_name = _norm_class_name(raw_name) if raw_name else \
-                    self._fallback.get(cls_id, f"SIGN_{cls_id}")
-        bbox      = _scale_bbox(tuple(xyxys[best_i]), sx, sy)  # type: ignore[arg-type]
-
-        det = SignDetection(sign_type=sign_name,
-                            confidence=float(confs[best_i]),
-                            bbox=bbox)
-        log.debug("Sign: %s  conf=%.2f", sign_name, det.confidence)
+        # Winner = highest confidence across both models
+        best_conf, sign_name, bbox = max(candidates, key=lambda t: t[0])
+        det = SignDetection(sign_type=sign_name, confidence=best_conf, bbox=bbox)
+        log.debug("Sign (ensemble): %s  conf=%.2f", sign_name, best_conf)
         return det
 
 

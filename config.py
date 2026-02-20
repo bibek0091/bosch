@@ -162,10 +162,12 @@ MODEL_TRAFFIC_LIGHT: str  = str(MODELS_DIR / "traffic_light.pt")        # med  ~
 # MODEL_TRAFFIC_LIGHT: str = str(MODELS_DIR / "traffic_light_nano.pt")   # nano  ~6 MB (fastest for Pi)
 
 # ── Road sign / highway sign detector ─────────────────────────────────────
-# Two variants: best.pt (v1) and last.pt (v2) — both detect highway signs.
-# Use v1 by default; swap to v2 to compare.
-MODEL_ROAD_SIGN: str      = str(MODELS_DIR / "road_sign.pt")     # from best.pt  ~6 MB  (v1, default)
-# MODEL_ROAD_SIGN: str     = str(MODELS_DIR / "road_sign_v2.pt")  # from last.pt  ~6 MB  (v2 alternative)
+# ENSEMBLE: both models run simultaneously — highest confidence result is used.
+#   road_sign.pt   = best.pt  (YOLOv8n, v1 weights — good recall)
+#   road_sign_v2.pt = last.pt (YOLOv8n, v2 weights — better precision)
+# Set either to "" to disable that model; setting both "" disables sign detection.
+MODEL_ROAD_SIGN: str    = str(MODELS_DIR / "road_sign.pt")    # best.pt  ~6 MB
+MODEL_ROAD_SIGN_V2: str = str(MODELS_DIR / "road_sign_v2.pt") # last.pt  ~6 MB
 
 # ── Obstacle detector ─────────────────────────────────────────────────────
 # No dedicated obstacle .pt model supplied yet — detector disabled.
