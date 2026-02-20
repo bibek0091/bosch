@@ -240,7 +240,7 @@ class Dashboard:
         cv2.line(c, (self.X_R, pt), (self.X_R, pb), C_BORDER, 1)
 
     # ------------------------------------------------------------------
-    # LEFT PANEL — camera + AI detection overlays
+    # LEFT PANEL — camera + rich AI detection overlays
     # ------------------------------------------------------------------
     def _draw_left_panel(self, c: np.ndarray, s: dict) -> None:
         x0  = self.X_L + 12
@@ -248,22 +248,51 @@ class Dashboard:
         pw  = self.PW_L - 24
         ph  = self.PH  - 36
 
-        _section_label(c, "CAMERA", x0, y0 - 6)
+        _section_label(c, "CAMERA  /  AI DETECTIONS", x0, y0 - 6)
 
         frame = s["raw_frame"]
         if frame is not None:
             img = cv2.resize(frame, (pw, ph))
+            sx  = pw / config.CAM_W    # horizontal scale factor
+            sy_ = ph / config.CAM_H    # vertical scale factor
 
-            # AI bounding box overlays on camera view
+            # ── Rich detection overlays ──────────────────────────────
             for label, conf, bbox in s["ai_overlays"]:
-                if bbox:
-                    x1 = int(bbox[0] * pw / config.CAM_W)
-                    y1 = int(bbox[1] * ph / config.CAM_H)
-                    x2 = int(bbox[2] * pw / config.CAM_W)
-                    y2 = int(bbox[3] * ph / config.CAM_H)
-                    cv2.rectangle(img, (x1, y1), (x2, y2), C_BLUE, 2)
-                    _text(img, f"{label} {conf:.0%}",
-                          (x1 + 4, y1 + 16), FONT, 0.40, C_BLUE, 1)
+                if bbox is None:
+                    continue
+                x1 = int(bbox[0] * sx);  y1 = int(bbox[1] * sy_)
+                x2 = int(bbox[2] * sx);  y2 = int(bbox[3] * sy_)
+                x1 = max(0, x1);         y1 = max(0, y1)
+                x2 = min(pw - 1, x2);    y2 = min(ph - 1, y2)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                tl_suffix = label.split(":")[-1] if label.startswith("TL:") else ""
+                col = self._det_colour(label, tl_suffix)
+
+                # Outer box + dark inner border for readability
+                cv2.rectangle(img, (x1, y1), (x2, y2), col, 2, cv2.LINE_AA)
+                cv2.rectangle(img, (x1+2, y1+2), (x2-2, y2-2),
+                              (0, 0, 0), 1, cv2.LINE_AA)
+
+                # Corner accent brackets
+                cr = min(14, (x2-x1)//4, (y2-y1)//4)
+                for (cx_, cy_, dx, dy) in [
+                    (x1,y1,1,1),(x2,y1,-1,1),(x1,y2,1,-1),(x2,y2,-1,-1)
+                ]:
+                    cv2.line(img,(cx_,cy_),(cx_+dx*cr,cy_),col,2)
+                    cv2.line(img,(cx_,cy_),(cx_,cy_+dy*cr),col,2)
+
+                # Label pill
+                disp = label if label.startswith("TL:") else f"{label}  {conf:.0%}"
+                _draw_pill(img, disp, x1, y1, col, conf)
+
+            # ── Traffic-light indicator (top-right corner of camera) ──
+            tl_name = _tl_name(s["traffic_light"])
+            _draw_tl_corner(img, tl_name, pw)
+
+            # ── Behaviour decision banner (bottom of camera) ──────────
+            _draw_decision_banner(img, s["behavior_mode"], pw, ph)
 
             c[y0:y0 + ph, x0:x0 + pw] = img
             _border_rect(c, x0, y0, x0 + pw, y0 + ph, C_BORDER, 1, 6)
@@ -273,7 +302,7 @@ class Dashboard:
                   (x0 + pw // 2, y0 + ph // 2),
                   FONT_BOLD, 0.65, C_DIMWHITE, 1, center=True)
 
-        # Sign hold badge (below camera)
+        # ── Last-seen sign badge (below camera panel) ────────────────
         now = time.monotonic()
         if s["sign_label"]:
             self._sign_cache      = s["sign_label"]
@@ -281,10 +310,32 @@ class Dashboard:
             self._sign_until      = now + config.DASH_SIGN_DISPLAY_SEC
         if now < self._sign_until:
             sy = y0 + ph + 10
-            _rr(c, x0, sy, x0 + pw, sy + 28, C_BLUE, 6)
-            _text(c, f"SIGN: {self._sign_cache}  {self._sign_conf_cache:.0%}",
+            sign_col = _sign_badge_colour(self._sign_cache)
+            _rr(c, x0, sy, x0 + pw, sy + 28, sign_col, 6)
+            _text(c, f"LAST SIGN: {self._sign_cache}  {self._sign_conf_cache:.0%}",
                   (x0 + pw // 2, sy + 20),
                   FONT_BOLD, 0.46, C_BG, 1, center=True)
+
+    # ------------------------------------------------------------------
+    # DETECTION COLOUR MAP
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _det_colour(label: str, tl_suffix: str = "") -> tuple:
+        """Return BGR colour for a detection overlay box by label type."""
+        if label.startswith("TL:"):
+            if "GREEN"  in tl_suffix: return (40,  210, 40)
+            if "YELLOW" in tl_suffix: return (0,   190, 215)
+            if "RED"    in tl_suffix: return (40,   40, 220)
+            if "DARK"   in tl_suffix: return (80,   80, 90)
+            return (160, 160, 160)
+        if "OBSTACLE" in label:                  return (30,   30, 220)   # red
+        if any(k in label for k in ("STOP_SIGN", "STOP")): return (20, 80, 230)
+        if "ZEBRA"    in label:                  return (20,  200, 220)   # yellow
+        if "HIGHWAY"  in label:                  return (220, 180,  20)   # cyan-blue
+        if "PARKING"  in label:                  return (200,  50, 200)   # magenta
+        if "DIVIDER"  in label:                  return (220, 210,  20)   # cyan
+        if "SIGN"     in label:                  return (30,  130, 255)   # orange
+        return (200, 160, 255)                                              # purple fallback
 
     # ------------------------------------------------------------------
     # CENTRE PANEL — speed arc gauge + steering wheel
@@ -616,10 +667,162 @@ def _behav_col(mode):
         "SLOW":      C_YELLOW,
         "HIGHWAY":   C_BLUE,
         "DETOUR":    C_CYAN,
-        "HONK":      C_ORANGE,   # Competition Fix: HONK mode colour added
-        "STOP_SIGN": C_RED,      # Competition Fix: explicit STOP_SIGN badge colour
+        "HONK":      C_ORANGE,
+        "STOP_SIGN": C_RED,
         "NORMAL":    C_GREEN,
     }.get(mode, C_DIMWHITE)
+
+
+# ---------------------------------------------------------------------------
+# Camera-overlay helpers   (used by _draw_left_panel)
+# ---------------------------------------------------------------------------
+
+def _draw_pill(img: np.ndarray, text: str, x: int, y: int,
+               col: tuple, conf: float) -> None:
+    """
+    Draw a filled label pill with white text and a confidence bar below it.
+    Positioned at the top-left corner (x, y) of the bounding box.
+    """
+    font, scale, thick = cv2.FONT_HERSHEY_DUPLEX, 0.44, 1
+    (tw, th), bl = cv2.getTextSize(text, font, scale, thick)
+    pad  = 4
+    px1  = max(x, 0)
+    py1  = max(y - th - pad * 2, 0)
+    px2  = px1 + tw + pad * 2
+    py2  = py1 + th + pad * 2
+    # Semi-transparent pill background
+    overlay = img.copy()
+    cv2.rectangle(overlay, (px1, py1), (px2, py2), col, -1)
+    cv2.addWeighted(overlay, 0.82, img, 0.18, 0, img)
+    # Text
+    cv2.putText(img, text, (px1 + pad, py2 - pad - bl),
+                font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+    # Confidence bar
+    bar_w  = tw + pad * 2
+    bar_y1 = py2 + 2
+    bar_y2 = bar_y1 + 3
+    cv2.rectangle(img, (px1, bar_y1), (px1 + bar_w, bar_y2), (40, 40, 40), -1)
+    fill = int(bar_w * max(0.0, min(conf, 1.0)))
+    if fill > 0:
+        cv2.rectangle(img, (px1, bar_y1), (px1 + fill, bar_y2), col, -1)
+
+
+def _draw_tl_corner(img: np.ndarray, tl_name: str, img_w: int) -> None:
+    """
+    Draw a compact traffic-light 3-lamp indicator in the top-right corner
+    of the camera image. The active lamp glows; others are dim.
+    Also shows the TL state text below the lamps.
+    """
+    r     = 9      # lamp radius
+    gap   = 24     # lamp centre spacing
+    pad   = 10
+    bx    = img_w - pad - r               # rightmost lamp centre x
+    lamps = [
+        ("RED",    (50,  50, 220), (15, 15, 60)),
+        ("YELLOW", (0,  200, 220), (10, 55, 55)),
+        ("GREEN",  (40, 200,  40), (10, 50, 15)),
+    ]
+    # Background housing
+    housing_x1 = bx - r - 5
+    housing_x2 = bx + r + 5
+    housing_y1 = pad - 5
+    housing_y2 = pad + len(lamps) * gap + 5
+    cv2.rectangle(img, (housing_x1, housing_y1), (housing_x2, housing_y2),
+                  (20, 20, 20), -1)
+    cv2.rectangle(img, (housing_x1, housing_y1), (housing_x2, housing_y2),
+                  (80, 80, 80), 1)
+
+    for i, (name, on_c, off_c) in enumerate(lamps):
+        cy   = pad + r + i * gap
+        lit  = name in tl_name.upper() and tl_name not in ("NONE", "--")
+        col  = on_c if lit else off_c
+        cv2.circle(img, (bx, cy), r, col, -1)
+        if lit:
+            # Glow effect
+            ov = np.zeros_like(img)
+            cv2.circle(ov, (bx, cy), r + 6, col, -1)
+            ov = cv2.GaussianBlur(ov, (11, 11), 0)
+            cv2.add(img, ov, img)
+
+    # State label below the housing
+    label_y = housing_y2 + 14
+    tl_col  = ((40, 200, 40)  if "GREEN"  in tl_name else
+               (40,  40, 220) if tl_name in ("RED", "DARK") else
+               (0,  200, 220) if "YELLOW" in tl_name else
+               (130, 130, 130))
+    # Dark strip behind label
+    lw = cv2.getTextSize(tl_name, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)[0][0]
+    cv2.rectangle(img, (bx - lw // 2 - 4, label_y - 12),
+                       (bx + lw // 2 + 4, label_y + 3), (0, 0, 0), -1)
+    cv2.putText(img, tl_name, (bx - lw // 2, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, tl_col, 1, cv2.LINE_AA)
+
+
+def _draw_decision_banner(img: np.ndarray, behavior_mode: str,
+                          img_w: int, img_h: int) -> None:
+    """
+    Draws a prominent decision banner at the bottom of the camera image.
+    Shows the car's current behavior decision in large, color-coded text.
+    Acts as the 'what is the car doing right now?' indicator.
+    """
+    # ── Map mode to display text + colour ───────────────────────────────
+    MODE_DISPLAY = {
+        "FULL_STOP":      ("FULL STOP",    (30,   30, 200), True),
+        "RED_STOP":       ("RED  STOP",    (30,   30, 200), True),
+        "STOP_SIGN_HOLD": ("STOP SIGN",    (30,   30, 200), True),
+        "SLOW":           ("SLOW DOWN",    (0,   170, 200), False),
+        "YELLOW_SLOW":    ("SLOW / READY", (0,   170, 200), False),
+        "HIGHWAY":        ("HIGHWAY",      (200, 160,  20), False),
+        "DETOUR":         ("DETOURING",    (200, 200,   0), False),
+        "ZEBRA_APPROACH": ("ZEBRA / SLOW", (0,   200, 200), False),
+        "ZEBRA_STOP":     ("ZEBRA STOP",   (30,   30, 200), True),
+        "ZEBRA_DETOUR":   ("DETOUR",       (200, 200,   0), False),
+        "HONK":           ("HONKING",      (0,   130, 255), True),
+        "NORMAL":         ("DRIVING",      (40,  200,  40), False),
+    }
+    txt, col, blink = MODE_DISPLAY.get(
+        behavior_mode, (behavior_mode, (180, 180, 180), False)
+    )
+    # Blink: hide text every other second for critical states
+    if blink and int(time.monotonic() * 2) % 2 == 0:
+        return
+
+    bh     = 32
+    by1    = img_h - bh
+    by2    = img_h
+
+    # Semi-transparent dark fill
+    overlay = img.copy()
+    cv2.rectangle(overlay, (0, by1), (img_w, by2), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.60, img, 0.40, 0, img)
+
+    # Coloured left accent bar
+    cv2.rectangle(img, (0, by1), (6, by2), col, -1)
+
+    # Decision text centred
+    font, scale, thick = cv2.FONT_HERSHEY_DUPLEX, 0.68, 1
+    tw = cv2.getTextSize(txt, font, scale, thick)[0][0]
+    tx = (img_w - tw) // 2
+    ty = by1 + bh - 8
+    # Shadow for readability
+    cv2.putText(img, txt, (tx + 1, ty + 1), font, scale, (0, 0, 0), thick + 1, cv2.LINE_AA)
+    cv2.putText(img, txt, (tx, ty),         font, scale, col,        thick,     cv2.LINE_AA)
+
+    # Confidence bar at very bottom edge (shows speed multiplier as fill)
+    speed_scale_bar_w = int(img_w * 1.0)   # always full for now
+    cv2.rectangle(img, (0, by2 - 2), (speed_scale_bar_w, by2), col, -1)
+
+
+def _sign_badge_colour(sign_type: str) -> tuple:
+    """Return BGR fill colour for the last-seen sign badge below the camera panel."""
+    s = sign_type.upper() if sign_type else ""
+    if "STOP"     in s: return (30,   30, 200)   # red
+    if "HIGHWAY"  in s: return (200, 160,  20)   # cyan
+    if "ZEBRA"    in s: return (0,   200, 200)   # yellow
+    if "PARKING"  in s: return (160,  30, 160)   # magenta
+    return C_BLUE                                  # default electric blue
+
+
 
 
 # ---------------------------------------------------------------------------
