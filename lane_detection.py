@@ -296,9 +296,13 @@ class HybridLaneTracker:
             dbg[nzy[ri], nzx[ri]] = [80, 80, 255]
         return li, ri, dbg
 
-    def _width_sane(self, lf: np.ndarray, rf: np.ndarray, y: int = 400) -> bool:
+    def _width_sane(self, lf: np.ndarray, rf: np.ndarray) -> bool:
+        """Check that measured lane width at bottom of BEV is within plausible bounds.
+        FIX: was hardcoded y=400 — now uses config.BEV_H - 50 so it adapts to resolution.
+        """
+        y = config.BEV_H - 50
         w = np.polyval(rf, y) - np.polyval(lf, y)
-        return 80 < w < 560
+        return 60 < w < 600    # widen tolerance slightly for calibration drift
 
     def _ema(self, prev: Optional[np.ndarray], new: np.ndarray) -> np.ndarray:
         if prev is None:

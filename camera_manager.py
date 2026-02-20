@@ -60,6 +60,7 @@ class CameraManager:
 
         # Pre-allocate blank fallback frame
         self._blank = np.zeros((config.CAM_H, config.CAM_W, 3), dtype=np.uint8)
+        self._frame_count: int = 0   # monotonic counter — useful for staleness check
 
         if not sim_mode:
             self._init_camera()
@@ -95,15 +96,21 @@ class CameraManager:
 
     def get_frame(self) -> np.ndarray:
         """
-        Return the latest captured frame as a BGR numpy array.
+        Return a copy of the latest captured frame (BGR numpy array).
 
-        This is a near-zero-copy read; the caller must NOT modify the array.
-        Returns the blank frame if no capture has occurred yet.
+        REAL-LIFE FIX: returns .copy() so callers cannot observe a
+        partially-written buffer if the capture thread updates it mid-read.
+        Picamera2 may also recycle the DMA buffer — copy guarantees ownership.
         """
         with self._lock:
             if self._frame is None:
-                return self._blank
-            return self._frame
+                return self._blank.copy()
+            return self._frame.copy()
+
+    @property
+    def frame_count(self) -> int:
+        """Monotonically increasing counter — use to detect stale frames."""
+        return self._frame_count
 
     @property
     def is_camera_ok(self) -> bool:
@@ -147,16 +154,21 @@ class CameraManager:
             if self._cam_ok:
                 try:
                     raw = self._picam2.capture_array()   # BGR numpy array
+                    # FIX: np.array() creates an owned copy so Picamera2 can
+                    # safely recycle its DMA buffer without corrupting our frame.
+                    owned = np.array(raw, copy=True)
                     with self._lock:
-                        self._frame = raw
+                        self._frame = owned
+                        self._frame_count += 1
                 except Exception as exc:
                     log.warning("CameraManager: capture error: %s", exc)
                     with self._lock:
-                        self._frame = self._blank
+                        self._frame = self._blank.copy()
             else:
                 # Sim mode or camera failure — produce blank frame
                 with self._lock:
-                    self._frame = self._blank
+                    if self._frame is None:
+                        self._frame = self._blank.copy()
 
             # Pace to TARGET_FPS
             elapsed = time.monotonic() - t0

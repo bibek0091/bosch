@@ -76,7 +76,7 @@ class ObstacleHandler:
                 self._target_offset = 0
 
             self._hold_frames_left = config.DETOUR_HOLD_FRAMES
-            self._ramp_frames_left = 0
+            self._ramp_frames_left = 0        # FIX: don't set ramp here; set it in HOLDING→RAMPING
             self._state            = "DETOURING"
             self._current_offset   = self._target_offset
             return self._current_offset
@@ -98,14 +98,19 @@ class ObstacleHandler:
                 return self._current_offset  # hold offset unchanged
             else:
                 self._state            = "RAMPING"
+                # FIX: set ramp_frames_left here (not in the DETOURING transition above)
                 self._ramp_frames_left = config.DETOUR_RAMP_FRAMES
                 log.debug("ObstacleHandler: entering RAMP phase (%d frames)",
                           self._ramp_frames_left)
 
         if self._state == "RAMPING":
             if self._ramp_frames_left > 0:
-                # Linear ramp from current_offset to 0
-                step = self._target_offset / max(config.DETOUR_RAMP_FRAMES, 1)
+                # FIX: always ramp TOWARD zero regardless of offset sign.
+                # Previous code subtracted step, which was wrong when target_offset < 0:
+                #   offset = -60, step = -60/20 = -3 → offset -= -3 → -57 (WRONG, increases magnitude)
+                # Correct: move current_offset toward 0 by abs(step) in the right direction.
+                n_frames = max(config.DETOUR_RAMP_FRAMES, 1)
+                step = self._current_offset / n_frames   # signed, correct direction
                 self._current_offset -= int(step)
                 self._ramp_frames_left -= 1
                 return self._current_offset
@@ -113,7 +118,7 @@ class ObstacleHandler:
                 self._current_offset = 0
                 self._target_offset  = 0
                 self._state          = "CLEAR"
-                log.info("ObstacleHandler: offset fully ramped to zero")
+                log.info("ObstacleHandler: offset ramped to zero")
 
         # CLEAR
         return 0

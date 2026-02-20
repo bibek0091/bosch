@@ -351,43 +351,139 @@ class BFMCPilot:
         return max(la, config.LA_MIN_PX)
 
     def _show_raw(self, frame: np.ndarray) -> None:
-        """Show raw camera frame with AI bounding-box overlays."""
-        viz    = frame.copy()
+        """
+        Show raw camera frame with AI detection overlays.
+
+        Visual design:
+          - Each detection gets a coloured bounding box (class-specific colour)
+          - Label pill: filled background + white text so it reads on any background
+          - Confidence bar drawn below the label
+          - Large TL status banner at top with coloured fill
+          - HUD: AI fps + number of active detections
+        """
+        viz      = frame.copy()
+        h_viz, w_viz = viz.shape[:2]
         overlays = self.vision.get_overlays()   # [(label, conf, bbox), ...]
+
+        # ── Colour map by detection type ────────────────────────────────
+        def _box_colour(label: str, tl_name: str = "") -> tuple:
+            if label.startswith("TL:"):
+                if "GREEN"  in tl_name: return (40,  200, 40)
+                if "YELLOW" in tl_name: return (0,   190, 220)
+                if "RED"    in tl_name: return (40,   40, 220)
+                if "DARK"   in tl_name: return (80,   80, 80)
+                return (180, 180, 180)
+            if any(k in label for k in ("STOP", "ZEBRA", "ONE_WAY", "SIGN")):
+                return (255, 120, 0)    # electric orange (signs)
+            if "HIGHWAY" in label:
+                return (255, 200, 0)    # cyan-ish (highway)
+            if "PARKING" in label:
+                return (200, 50, 200)   # magenta
+            return (200, 160, 255)      # light purple fallback
+
+        def _draw_label_pill(img, text: str, x: int, y: int, col: tuple, conf: float):
+            """Draw filled pill + white text + confidence bar."""
+            font, scale, thick = cv2.FONT_HERSHEY_DUPLEX, 0.52, 1
+            (tw, th), baseline = cv2.getTextSize(text, font, scale, thick)
+            pad   = 5
+            px1   = max(x, 0)
+            py1   = max(y - th - pad * 2, 0)
+            px2   = min(px1 + tw + pad * 2, img.shape[1] - 1)
+            py2   = py1 + th + pad * 2
+            # Filled pill background
+            cv2.rectangle(img, (px1, py1), (px2, py2), col, -1)
+            # Text
+            cv2.putText(img, text, (px1 + pad, py2 - pad - baseline),
+                        font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+            # Confidence bar (below pill)
+            bar_w  = tw + pad * 2
+            bar_h  = 4
+            bar_y1 = py2 + 2
+            bar_y2 = bar_y1 + bar_h
+            cv2.rectangle(img, (px1, bar_y1), (px1 + bar_w, bar_y2), (60,60,60), -1)
+            fill_w = int(bar_w * max(0.0, min(conf, 1.0)))
+            if fill_w > 0:
+                cv2.rectangle(img, (px1, bar_y1), (px1 + fill_w, bar_y2), col, -1)
+
+        # ── Draw each detection ─────────────────────────────────────────
         for label, conf, bbox in overlays:
             if bbox is None:
                 continue
-            x1, y1, x2, y2 = bbox
-            # Colour code by detection type
-            if label.startswith("TL:"):
-                tl_name = label.split(":")[-1]
-                col = (60, 220, 60) if "GREEN" in tl_name else \
-                      (0, 200, 220) if "YELLOW" in tl_name else \
-                      (50, 50, 220) if tl_name in ("RED", "DARK") else \
-                      (200, 200, 200)
-                cv2.rectangle(viz, (x1, y1), (x2, y2), col, 3)
-                cv2.putText(viz, label, (x1, max(y1 - 6, 14)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2, cv2.LINE_AA)
-                # Glow halo for traffic light
-                cv2.rectangle(viz, (x1-2, y1-2), (x2+2, y2+2), col, 1)
-            else:
-                col = (255, 160, 0)
-                cv2.rectangle(viz, (x1, y1), (x2, y2), col, 2)
-                cv2.putText(viz, f"{label} {conf:.0%}",
-                            (x1, max(y1 - 6, 14)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, col, 1, cv2.LINE_AA)
+            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+            # Clamp to frame
+            x1 = max(0, x1); y1 = max(0, y1)
+            x2 = min(w_viz - 1, x2); y2 = min(h_viz - 1, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
 
-        # AI FPS + TL state in corner
+            tl_name = label.split(":")[-1] if label.startswith("TL:") else ""
+            col     = _box_colour(label, tl_name)
+
+            # Outer thick border
+            cv2.rectangle(viz, (x1, y1), (x2, y2), col, 3, cv2.LINE_AA)
+            # Inner thin dark border (makes bbox pop on any background)
+            cv2.rectangle(viz, (x1 + 2, y1 + 2), (x2 - 2, y2 - 2),
+                          (0, 0, 0), 1, cv2.LINE_AA)
+
+            # Corner accents
+            corner = min(20, (x2 - x1) // 4, (y2 - y1) // 4)
+            for cx, cy, dx, dy in [(x1,y1,1,1),(x2,y1,-1,1),(x1,y2,1,-1),(x2,y2,-1,-1)]:
+                cv2.line(viz, (cx, cy), (cx + dx * corner, cy), col, 3)
+                cv2.line(viz, (cx, cy), (cx, cy + dy * corner), col, 3)
+
+            # Label — show display name + confidence %
+            display = label if label.startswith("TL:") else f"{label}  {conf:.0%}"
+            _draw_label_pill(viz, display, x1, y1, col, conf)
+
+        # ── Traffic light status banner (top-right) ──────────────────────
         tl_s, _ = self.vision.last_tl_result()
-        tl_str  = f"TL:{tl_s.name}" if hasattr(tl_s, 'name') else str(tl_s)
-        tl_col  = (60, 220, 60) if tl_str.endswith("GREEN") else \
-                  (0, 200, 220) if tl_str.endswith("YELLOW") else \
-                  (50, 50, 220) if "RED" in tl_str or "DARK" in tl_str else \
-                  (170, 170, 170)
-        cv2.putText(viz, tl_str,
-                    (6, 22), cv2.FONT_HERSHEY_DUPLEX, 0.70, tl_col, 2, cv2.LINE_AA)
-        cv2.putText(viz, f"AI {self.vision.get_fps():.1f} fps",
-                    (6, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        tl_name  = tl_s.name if hasattr(tl_s, "name") else str(tl_s)
+        if tl_name == "NONE":
+            banner_col = (30, 30, 30)
+            banner_txt = ("--", (150, 150, 150))
+        elif tl_name == "GREEN":
+            banner_col = (20, 140, 20)
+            banner_txt = (" GO ", (255, 255, 255))
+        elif tl_name == "YELLOW":
+            banner_col = (0, 130, 180)
+            banner_txt = ("SLOW", (255, 255, 255))
+        elif tl_name in ("RED", "DARK"):
+            banner_col = (30, 30, 160)
+            banner_txt = ("STOP", (255, 255, 255))
+        else:
+            banner_col = (40, 40, 40)
+            banner_txt = (tl_name, (200, 200, 200))
+
+        bw, bh = 120, 36
+        bx     = w_viz - bw - 8
+        by     = 8
+        cv2.rectangle(viz, (bx, by), (bx + bw, by + bh), banner_col, -1)
+        cv2.rectangle(viz, (bx, by), (bx + bw, by + bh), (200,200,200), 1)
+        cv2.putText(viz, banner_txt[0],
+                    (bx + bw//2 - cv2.getTextSize(
+                        banner_txt[0], cv2.FONT_HERSHEY_DUPLEX, 0.72, 2)[0][0]//2,
+                     by + bh - 8),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.72, banner_txt[1], 2, cv2.LINE_AA)
+
+        # ── HUD: AI fps + detection count (top-left) ────────────────────
+        ai_fps    = self.vision.get_fps()
+        n_det     = len(overlays)
+        fps_col   = (80, 220, 80) if ai_fps >= 5 else (0, 140, 220)
+        hud_lines = [
+            (f"AI  {ai_fps:.1f} fps", fps_col, 0.48, 1),
+            (f"DET {n_det}",         (200,200,200), 0.42, 1),
+            (f"TL  {tl_name}",       banner_txt[1], 0.42, 1),
+        ]
+        # Semi-transparent dark strip behind HUD
+        strip_h = len(hud_lines) * 22 + 8
+        overlay_strip = viz.copy()
+        cv2.rectangle(overlay_strip, (0, 0), (160, strip_h), (0,0,0), -1)
+        cv2.addWeighted(overlay_strip, 0.45, viz, 0.55, 0, viz)
+
+        for i, (txt, tcol, tscale, tthick) in enumerate(hud_lines):
+            cv2.putText(viz, txt, (6, 20 + i * 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, tscale, tcol, tthick, cv2.LINE_AA)
+
         cv2.imshow("Camera + AI", viz)
 
     def _show_debug(
