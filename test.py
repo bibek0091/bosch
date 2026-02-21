@@ -1,5 +1,5 @@
 """
-BFMC Hybrid Pilot - Version 2.4 (Full Original Core + Traffic Light)
+BFMC Hybrid Pilot - Version 2.5 (Full Original Core + TL RGB Debug)
 """
 
 import cv2
@@ -14,7 +14,7 @@ import sys
 # Serial handler - graceful fallback
 # ---------------------------------------------------------------------------
 try:
-    sys.path.insert(0, "..")          # allow running from the sub-folder
+    sys.path.insert(0, "..")
     from serial_handler import STM32_SerialHandler
     _SERIAL_AVAILABLE = True
 except ImportError:
@@ -41,10 +41,10 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
 # ===========================================================================
-# PHYSICAL CONSTANTS  (measure your car carefully)
+# PHYSICAL CONSTANTS
 # ===========================================================================
-WHEELBASE_M          = 0.23    # front-to-rear axle distance (m)
-LANE_WIDTH_M         = 0.35    # one-lane physical width (m)
+WHEELBASE_M          = 0.23
+LANE_WIDTH_M         = 0.35
 
 # ===========================================================================
 # CAMERA - Bird's Eye View calibration
@@ -63,7 +63,7 @@ LOST_GRACE_FRAMES = 8
 
 
 # ===========================================================================
-# TRAFFIC LIGHT DETECTOR (NEW - Classical CV)
+# TRAFFIC LIGHT DETECTOR (With RGB Debug Visualization)
 # ===========================================================================
 class TrafficLightDetector:
     def __init__(self):
@@ -78,11 +78,12 @@ class TrafficLightDetector:
 
     def update(self, frame):
         if frame is None or frame.size == 0:
-            return False
+            return False, None
 
         # Check only upper half of the original frame
-        roi = frame[0:frame.shape[0]//2, :]
+        roi = frame[0:frame.shape[0]//2, :].copy()
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        tl_dbg = roi.copy() # Dedicated visualization window
 
         mask1 = cv2.inRange(hsv, self.red_low1, self.red_high1)
         mask2 = cv2.inRange(hsv, self.red_low2, self.red_high2)
@@ -91,18 +92,36 @@ class TrafficLightDetector:
         kernel = np.ones((5, 5), np.uint8)
         full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_OPEN, kernel)
 
-        # CORRECT SYNTAX used here
         contours, _ = cv2.findContours(full_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         found_red = False
         for cnt in contours:
             area = cv2.contourArea(cnt)
+            
+            # Draw ALL detected red blobs in thin blue
+            cv2.drawContours(tl_dbg, [cnt], -1, (255, 0, 0), 1)
+            
             if 40 < area < 5000:
                 perimeter = cv2.arcLength(cnt, True)
                 if perimeter == 0: continue
                 circularity = 4 * np.pi * (area / (perimeter * perimeter))
+                
+                # Find center to draw text
+                M = cv2.moments(cnt)
+                if M["m00"] != 0:
+                    cX = int(M["m10"] / M["m00"])
+                    cY = int(M["m01"] / M["m00"])
+                    
+                    # Print Area (A) and Circularity (C)
+                    cv2.putText(tl_dbg, f"A:{int(area)} C:{circularity:.2f}", (cX - 30, cY - 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
                 if circularity > 0.65:
                     found_red = True
+                    # Draw ACCEPTED light in thick green with a red center dot
+                    cv2.drawContours(tl_dbg, [cnt], -1, (0, 255, 0), 3)
+                    if M["m00"] != 0:
+                        cv2.circle(tl_dbg, (cX, cY), 4, (0, 0, 255), -1)
                     break
 
         if found_red:
@@ -110,11 +129,17 @@ class TrafficLightDetector:
         else:
             self.red_count = 0
 
-        return self.red_count >= self.RED_THRESHOLD_FRAMES
+        is_red = self.red_count >= self.RED_THRESHOLD_FRAMES
+
+        status_color = (0, 0, 255) if is_red else (0, 255, 0)
+        cv2.putText(tl_dbg, f"RED LIGHT: {is_red} (Frames: {self.red_count})", (10, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+
+        return is_red, tl_dbg
 
 
 # ===========================================================================
-# HYBRID LANE TRACKER (YOUR ORIGINAL LOGIC)
+# HYBRID LANE TRACKER
 # ===========================================================================
 class HybridLaneTracker:
 
@@ -319,7 +344,7 @@ class HybridLaneTracker:
 
 
 # ===========================================================================
-# JUNCTION DETECTOR (YOUR ORIGINAL LOGIC)
+# JUNCTION DETECTOR
 # ===========================================================================
 class JunctionDetector:
 
@@ -375,7 +400,7 @@ class JunctionDetector:
 
 
 # ===========================================================================
-# ROUNDABOUT NAVIGATOR (YOUR ORIGINAL LOGIC)
+# ROUNDABOUT NAVIGATOR
 # ===========================================================================
 class RoundaboutNavigator:
 
@@ -424,7 +449,7 @@ class RoundaboutNavigator:
 
 
 # ===========================================================================
-# DIVIDER GUARD (YOUR ORIGINAL LOGIC)
+# DIVIDER GUARD
 # ===========================================================================
 class DividerGuard:
 
@@ -508,7 +533,7 @@ class BFMC_Pilot:
         self.rbt         = RoundaboutNavigator()
         self.jct         = JunctionDetector()
         self.guard       = DividerGuard()
-        self.tl_detector = TrafficLightDetector() # ADDED HERE
+        self.tl_detector = TrafficLightDetector()
 
         # State
         self.smooth_steer  = 0.0
@@ -560,7 +585,7 @@ class BFMC_Pilot:
         self._fps = 0.9 * self._fps + 0.1 * (1.0 / max(dt, 1e-6))
 
     def run(self):
-        print("BFMC Pilot v2: STARTING — RIGHT LANE DRIVING + TRAFFIC LIGHT")
+        print("BFMC Pilot v2.5: STARTING — RIGHT LANE DRIVING + TRAFFIC LIGHT")
         try:
             while True:
                 t_frame_start = time.time()
@@ -579,7 +604,7 @@ class BFMC_Pilot:
                     frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
                 # --- 1. NEW: Traffic Light Detect ---
-                is_red = self.tl_detector.update(frame)
+                is_red, tl_dbg = self.tl_detector.update(frame)
 
                 # --- 2. ORIGINAL: Image Processing ---
                 warped = self._get_bev(frame)
@@ -716,6 +741,10 @@ class BFMC_Pilot:
                 cv2.putText(dbg, line2, (10, 462), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 255, 200), 2)
 
                 cv2.imshow("BFMC_v2", dbg)
+
+                # Show the Traffic Light Debug window
+                if tl_dbg is not None:
+                    cv2.imshow("TL_Debug", tl_dbg)
 
                 elapsed = time.time() - t_frame_start
                 wait_ms = max(1, int((FRAME_PERIOD - elapsed) * 1000))
