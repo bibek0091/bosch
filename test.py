@@ -1,5 +1,5 @@
 """
-BFMC Hybrid Pilot - Version 2.5 (Full Original Core + TL RGB Debug)
+BFMC Hybrid Pilot - Version 2.6 (Color Channel Fix)
 """
 
 import cv2
@@ -63,11 +63,10 @@ LOST_GRACE_FRAMES = 8
 
 
 # ===========================================================================
-# TRAFFIC LIGHT DETECTOR (With RGB Debug Visualization)
+# TRAFFIC LIGHT DETECTOR
 # ===========================================================================
 class TrafficLightDetector:
     def __init__(self):
-        # Red spans two ranges in HSV
         self.red_low1 = np.array([0, 120, 70])
         self.red_high1 = np.array([10, 255, 255])
         self.red_low2 = np.array([160, 120, 70])
@@ -80,10 +79,9 @@ class TrafficLightDetector:
         if frame is None or frame.size == 0:
             return False, None
 
-        # Check only upper half of the original frame
         roi = frame[0:frame.shape[0]//2, :].copy()
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        tl_dbg = roi.copy() # Dedicated visualization window
+        tl_dbg = roi.copy() 
 
         mask1 = cv2.inRange(hsv, self.red_low1, self.red_high1)
         mask2 = cv2.inRange(hsv, self.red_low2, self.red_high2)
@@ -98,7 +96,7 @@ class TrafficLightDetector:
         for cnt in contours:
             area = cv2.contourArea(cnt)
             
-            # Draw ALL detected red blobs in thin blue
+            # NOTE: (255, 0, 0) in OpenCV is Blue. This intentionally draws a blue outline around all blobs.
             cv2.drawContours(tl_dbg, [cnt], -1, (255, 0, 0), 1)
             
             if 40 < area < 5000:
@@ -106,19 +104,17 @@ class TrafficLightDetector:
                 if perimeter == 0: continue
                 circularity = 4 * np.pi * (area / (perimeter * perimeter))
                 
-                # Find center to draw text
                 M = cv2.moments(cnt)
                 if M["m00"] != 0:
                     cX = int(M["m10"] / M["m00"])
                     cY = int(M["m01"] / M["m00"])
                     
-                    # Print Area (A) and Circularity (C)
                     cv2.putText(tl_dbg, f"A:{int(area)} C:{circularity:.2f}", (cX - 30, cY - 15),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
                 if circularity > 0.65:
                     found_red = True
-                    # Draw ACCEPTED light in thick green with a red center dot
+                    # Accepted light is drawn in Green (0, 255, 0)
                     cv2.drawContours(tl_dbg, [cnt], -1, (0, 255, 0), 3)
                     if M["m00"] != 0:
                         cv2.circle(tl_dbg, (cX, cY), 4, (0, 0, 255), -1)
@@ -142,7 +138,7 @@ class TrafficLightDetector:
 # HYBRID LANE TRACKER
 # ===========================================================================
 class HybridLaneTracker:
-
+    # (Keeping all your exact original code here)
     NWINDOWS         = 9
     SW_MARGIN        = 60
     MINPIX           = 50
@@ -528,14 +524,12 @@ class BFMC_Pilot:
         self.M     = cv2.getPerspectiveTransform(SRC_PTS, DST_PTS)
         self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
-        # Core systems
         self.tracker     = HybridLaneTracker(img_shape=(480, 640))
         self.rbt         = RoundaboutNavigator()
         self.jct         = JunctionDetector()
         self.guard       = DividerGuard()
         self.tl_detector = TrafficLightDetector()
 
-        # State
         self.smooth_steer  = 0.0
         self.smooth_guard  = 0.0
         self.prev_steer    = 0.0
@@ -585,7 +579,7 @@ class BFMC_Pilot:
         self._fps = 0.9 * self._fps + 0.1 * (1.0 / max(dt, 1e-6))
 
     def run(self):
-        print("BFMC Pilot v2.5: STARTING — RIGHT LANE DRIVING + TRAFFIC LIGHT")
+        print("BFMC Pilot v2.6: STARTING — BGR COLOR FIX + TRAFFIC LIGHT DEBUG")
         try:
             while True:
                 t_frame_start = time.time()
@@ -600,25 +594,27 @@ class BFMC_Pilot:
 
                 if self.cam_ok:
                     frame = self.picam2.capture_array()
+                    # FIX: Swap the color channels immediately!
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 else:
                     frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
-                # --- 1. NEW: Traffic Light Detect ---
+                # --- 1. Traffic Light Detect ---
                 is_red, tl_dbg = self.tl_detector.update(frame)
 
-                # --- 2. ORIGINAL: Image Processing ---
+                # --- 2. Image Processing ---
                 warped = self._get_bev(frame)
 
-                # --- 3. ORIGINAL: Lane tracking ---
+                # --- 3. Lane tracking ---
                 sl, sr, dbg, detect_mode = self.tracker.update(warped)
 
-                # --- 4. ORIGINAL: State machines ---
+                # --- 4. State machines ---
                 jct_state = self.jct.update(warped, self.tracker.left_conf, self.tracker.right_conf,
                                             self.tracker.left_fit, self.tracker.right_fit, lane_width_px)
                 rbt_state = self.rbt.update(self.tracker.left_fit, self.tracker.right_fit, lane_width_px)
                 nav_state = rbt_state if rbt_state == "ROUNDABOUT" else jct_state
 
-                # --- 5. ORIGINAL: Look-ahead ---
+                # --- 5. Look-ahead ---
                 curvature_pre = self.tracker.get_curvature(self.tracker.h // 2)
                 if nav_state == "ROUNDABOUT":
                     eff_la = int(look_ahead * self.rbt.LOOKAHEAD_SCALE)
@@ -634,7 +630,7 @@ class BFMC_Pilot:
                 eff_la = max(60, eff_la)
                 y_eval = max(0, 480 - eff_la)
 
-                # --- 6. ORIGINAL: Target x ---
+                # --- 6. Target x ---
                 target_x, anchor = self.tracker.get_target_x(y_eval, lane_width_px, total_offset, nav_state)
 
                 lost = target_x is None
@@ -645,7 +641,7 @@ class BFMC_Pilot:
                     self.lost_frames  = 0
                     self.last_target  = target_x
 
-                # --- 7. ORIGINAL: Pure pursuit ---
+                # --- 7. Pure pursuit ---
                 raw_steer = self._pure_pursuit(target_x, eff_la, lane_width_px)
 
                 steer_delta_abs = abs(raw_steer - self.smooth_steer)
@@ -658,7 +654,7 @@ class BFMC_Pilot:
                 steer_angle    = self.prev_steer + rate_delta
                 self.prev_steer = steer_angle
 
-                # --- 8. ORIGINAL: Guard ---
+                # --- 8. Guard ---
                 guard_left  = (self.tracker.sl if self.tracker.left_stale  == 0 else None)
                 guard_right = (self.tracker.sr if self.tracker.right_stale == 0 else None)
 
@@ -673,11 +669,11 @@ class BFMC_Pilot:
                     self.smooth_guard = (self.GUARD_EMA * guard_delta + (1.0 - self.GUARD_EMA) * self.smooth_guard)
                 steer_angle = steer_angle + self.smooth_guard
 
-                # --- 9. MODIFIED: Speed policy (Red Light Check at the top) ---
+                # --- 9. Speed policy ---
                 curvature = self.tracker.get_curvature(y_eval)
 
                 if is_red:
-                    speed = 0.0 # <--- STOP FOR RED LIGHT
+                    speed = 0.0
                 elif self.lost_frames > LOST_GRACE_FRAMES:
                     speed = 0.0
                 elif base_speed == 0:
@@ -707,12 +703,12 @@ class BFMC_Pilot:
 
                 steer_angle = max(-self.MAX_STEER, min(self.MAX_STEER, steer_angle))
 
-                # --- 10. ORIGINAL: Actuate ---
+                # --- 10. Actuate ---
                 if self.connected:
                     self.handler.set_speed(speed)
                     self.handler.set_steering(steer_angle)
 
-                # --- 11. ORIGINAL: Visualisation ---
+                # --- 11. Visualisation ---
                 self._draw_poly(dbg, sl, (255, 220, 0))
                 self._draw_poly(dbg, sr, (0,   200, 255))
 
@@ -742,7 +738,6 @@ class BFMC_Pilot:
 
                 cv2.imshow("BFMC_v2", dbg)
 
-                # Show the Traffic Light Debug window
                 if tl_dbg is not None:
                     cv2.imshow("TL_Debug", tl_dbg)
 
